@@ -20,7 +20,8 @@ from .recommendation_graphs import (
 )
 from .representation_graphs import AbstractRepresentationGraph, LinearRepresentationGraph
 from .session_management import get_session
-from .util import sample_items, calculate_batched_alpha, datasets_from_raw_input
+from .util import (sample_items, calculate_batched_alpha, datasets_from_raw_input, sample_items_stratified,
+                   variable_summaries, get_memory)
 
 
 class TensorRec(object):
@@ -33,7 +34,9 @@ class TensorRec(object):
                  attention_graph=None,
                  prediction_graph=DotProductPredictionGraph(),
                  loss_graph=RMSELossGraph(),
-                 biased=True,):
+                 biased=True,
+                 stratified_sample=False,
+                 logdir='.',):
         """
         A TensorRec recommendation model.
         :param n_components: Integer
@@ -95,6 +98,8 @@ class TensorRec(object):
         self.prediction_graph_factory = prediction_graph
         self.loss_graph_factory = loss_graph
         self.biased = biased
+        self.stratified_sample = stratified_sample
+        self.logdir = logdir
 
         # A list of the attr names of every graph hook attr
         self.graph_tensor_hook_attr_names = [
@@ -278,6 +283,9 @@ class TensorRec(object):
         self.tf_similar_items_ids = tf.placeholder('int64', [None])
         self.tf_learning_rate = tf.placeholder('float', None)
         self.tf_alpha = tf.placeholder('float', None)
+        self.tf_epoch = tf.placeholder('int32', None)
+        self.tf_batch_size = tf.placeholder('int32', None)
+        self.tf_stratified_sample = tf.placeholder('int32', None)
 
         tf_user_feature_rows, tf_user_feature_cols, tf_user_feature_values, tf_n_users, _ = \
             self.tf_user_feature_iterator.get_next()
@@ -298,11 +306,17 @@ class TensorRec(object):
         tf_interactions = tf.SparseTensor(tf_interaction_indices, tf_interaction_values,
                                           [tf_n_users, tf_n_items])
 
-        # Construct the sampling py_func
-        sample_items_partial = partial(sample_items, replace=self.loss_graph_factory.is_sampled_with_replacement)
-        self.tf_sample_indices = tf.py_func(func=sample_items_partial,
-                                            inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items],
-                                            Tout=tf.int64)
+        if self.stratified_sample:
+            sample_items_partial = partial(sample_items_stratified, replace=self.loss_graph_factory.is_sampled_with_replacement)
+            self.tf_sample_indices = tf.py_func(func=sample_items_partial,
+                                                inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items,
+                                                     tf_interaction_rows, tf_interaction_cols, tf_interaction_values],
+                                                Tout=tf.int64)
+        else:
+            sample_items_partial = partial(sample_items, replace=self.loss_graph_factory.is_sampled_with_replacement)
+            self.tf_sample_indices = tf.py_func(func=sample_items_partial,
+                                                inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items],
+                                                Tout=tf.int64)
         self.tf_sample_indices.set_shape([None, None])
 
         # Collect the weights for regularization
@@ -599,6 +613,8 @@ class TensorRec(object):
         # If it hasn't been constructed, initialize it
         if self.tf_prediction is None:
 
+            memory_var = tf.Variable(get_memory() / 1000000000, name='memory')
+
             # Check input dimensions
             first_batch = dataset_sets[0]
             _, n_user_features = get_dimensions_from_tensorrec_dataset(first_batch[1])
@@ -618,25 +634,38 @@ class TensorRec(object):
         if verbose:
             logging.info('Beginning fitting')
 
+        item_weights_var = [v for v in tf.global_variables() if "linear_weights_item" in v.name][0]
+        with tf.name_scope('item_weights'):
+            variable_summaries(item_weights_var)
+        with tf.name_scope('training'):
+            tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
+            tf.summary.scalar('mean_loss', tf.reduce_mean(self.tf_basic_loss))
+            tf.summary.scalar('mean_pred', tf.reduce_mean(self.tf_prediction_serial))
+            tf.summary.scalar('memory', memory_var)
+        merged = tf.summary.merge_all()
+        train_writer = tf.summary.FileWriter(self.logdir + '/train', session.graph)
+
         for epoch in range(epochs):
             for batch, initializers in enumerate(initializer_sets):
-
                 session.run(initializers)
                 if not verbose:
                     session.run(self.tf_optimizer, feed_dict=feed_dict)
 
                 else:
-                    _, loss, serial_predictions, wr_loss = session.run(
-                        [self.tf_optimizer, self.tf_basic_loss, self.tf_prediction_serial, self.tf_weight_reg_loss],
+                    _, _, loss, serial_predictions, wr_loss, summary = session.run(
+                        [memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_prediction_serial, self.tf_weight_reg_loss,
+                         merged],
                         feed_dict=feed_dict
                     )
                     mean_loss = np.mean(loss)
                     mean_pred = np.mean(serial_predictions)
                     weight_reg_l2_loss = alpha * wr_loss
+
+                    train_writer.add_summary(summary, epoch*len(initializer_sets) + batch)
+
                     logging.info('EPOCH {} BATCH {} loss = {}, weight_reg_l2_loss = {}, mean_pred = {}'.format(
                         epoch, batch, mean_loss, weight_reg_l2_loss, mean_pred
                     ))
-
     def predict(self, user_features, item_features):
         """
         Predict recommendation scores for the given users and items.

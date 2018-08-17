@@ -5,8 +5,42 @@ import scipy.sparse as sp
 import six
 import tensorflow as tf
 from weakref import WeakKeyDictionary
+import os
+import psutil
 
 from .input_utils import create_tensorrec_dataset_from_sparse_matrix, create_tensorrec_dataset_from_tfrecord
+
+
+def sample_items_stratified(n_items, n_users, n_sampled_items,
+                 tf_interaction_rows, tf_interaction_cols, tf_interaction_values,replace):
+    users = {}
+    for i, u in enumerate(tf_interaction_rows):
+        if tf_interaction_values[i] > 0.:
+            interact = users.get(u, [])
+            interact.append(tf_interaction_cols[i])
+            users[u] = interact
+
+    max_pos_num = int(0.5*n_sampled_items)
+    print 'interact:', tf_interaction_values.shape, 'users:', len(set(tf_interaction_rows)), 'items:', len(set(tf_interaction_cols))
+
+    def get_item(uid, users):
+        interact = users.get(uid, [])
+        if interact and len(interact) > max_pos_num:
+            interact = np.random.choice(interact, size=max_pos_num, replace=replace).tolist()
+        others = np.random.choice(a=n_items, size=n_sampled_items, replace=replace)
+        others = [x for x in others if x not in interact]
+        # print 'pos', len(interact)
+        interact.extend(others[:n_sampled_items-len(interact)])
+        # print 'all', len(interact)
+        return np.array(interact)
+
+    items_per_user = [get_item(uid, users) for uid in range(n_users)]
+    sample_indices = []
+    for user, users_items in enumerate(items_per_user):
+        for item in users_items:
+            sample_indices.append((user, item))
+
+    return np.array(sample_indices, np.int64)
 
 
 def sample_items(n_items, n_users, n_sampled_items, replace):
@@ -153,3 +187,21 @@ class lazyval(object):
 
     def __delitem__(self, instance):
         del self._cache[instance]
+
+
+def variable_summaries(var):
+  """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
+  with tf.name_scope('summaries'):
+    mean = tf.reduce_mean(var)
+    tf.summary.scalar('mean', mean)
+    with tf.name_scope('stddev'):
+      stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+    tf.summary.scalar('stddev', stddev)
+    tf.summary.scalar('max', tf.reduce_max(var))
+    tf.summary.scalar('min', tf.reduce_min(var))
+    tf.summary.histogram('histogram', var)
+
+
+def get_memory():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss
