@@ -279,13 +279,13 @@ class TensorRec(object):
     def _build_tf_graph(self, n_user_features, n_item_features):
 
         # Build placeholders
-        self.tf_n_sampled_items = tf.placeholder('int64')
-        self.tf_similar_items_ids = tf.placeholder('int64', [None])
-        self.tf_learning_rate = tf.placeholder('float', None)
-        self.tf_alpha = tf.placeholder('float', None)
-        self.tf_epoch = tf.placeholder('int32', None)
-        self.tf_batch_size = tf.placeholder('int32', None)
-        self.tf_stratified_sample = tf.placeholder('int32', None)
+        self.tf_n_sampled_items = tf.placeholder('int64', shape=None, name='n_sampled_items')
+        self.tf_similar_items_ids = tf.placeholder('int64', [None], name='similar_items_ids')
+        self.tf_learning_rate = tf.placeholder('float', None, name='learning_rate')
+        self.tf_alpha = tf.placeholder('float', None, name='alpha')
+        self.tf_epoch = tf.placeholder('int32', None, name='epoch')
+        self.tf_batch_size = tf.placeholder('int32', None, 'batch_size')
+        self.tf_stratified_sample = tf.placeholder('int32', None, 'stratified_sample')
 
         tf_user_feature_rows, tf_user_feature_cols, tf_user_feature_values, tf_n_users, _ = \
             self.tf_user_feature_iterator.get_next()
@@ -613,7 +613,7 @@ class TensorRec(object):
         # If it hasn't been constructed, initialize it
         if self.tf_prediction is None:
 
-            memory_var = tf.Variable(get_memory() / 1000000000, name='memory')
+            memory_var = tf.Variable(get_memory() / 1000000000, name='memory', trainable=False)
 
             # Check input dimensions
             first_batch = dataset_sets[0]
