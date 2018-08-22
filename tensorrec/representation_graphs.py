@@ -37,7 +37,7 @@ class LinearRepresentationGraph(AbstractRepresentationGraph):
 
         # Create variable nodes
         tf_linear_weights = tf.Variable(normalized_weights, name='linear_weights_{}'.format(node_name_ending))
-        tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
+        tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights, name='get_repr')
 
         # Return repr layer and variables
         return tf_repr, [tf_linear_weights]

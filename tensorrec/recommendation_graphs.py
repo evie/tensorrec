@@ -116,9 +116,10 @@ def relative_cosine(tf_tensor_1, tf_tensor_2):
     :param tf_tensor_2:
     :return:
     """
-    normalized_t1 = tf.nn.l2_normalize(tf_tensor_1, 1)
-    normalized_t2 = tf.nn.l2_normalize(tf_tensor_2, 1)
-    return tf.matmul(normalized_t1, normalized_t2, transpose_b=True)
+    with tf.name_scope('relative_cosine'):
+        normalized_t1 = tf.nn.l2_normalize(tf_tensor_1, 1)
+        normalized_t2 = tf.nn.l2_normalize(tf_tensor_2, 1)
+        return tf.matmul(normalized_t1, normalized_t2, transpose_b=True, name='predict_score')
 
 
 def predict_similar_items(prediction_graph_factory, tf_item_representation, tf_similar_items_ids):

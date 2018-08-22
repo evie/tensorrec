@@ -1,5 +1,6 @@
 import abc
 import tensorflow as tf
+import numpy as np
 
 
 class AbstractLossGraph(object):
@@ -14,8 +15,8 @@ class AbstractLossGraph(object):
     is_sampled_with_replacement = False
 
     @abc.abstractmethod
-    def connect_loss_graph(self, tf_prediction_serial, tf_interactions_serial, tf_interactions, tf_n_users, tf_n_items,
-                           tf_prediction, tf_rankings, tf_sample_predictions, tf_n_sampled_items):
+    def connect_loss_graph(self, tr, prediction_graph_factory, tf_user_representation, pos_item_representation, tf_item_representation, tf_n_users, tf_n_items,
+                           tf_interaction_rows, tf_interaction_cols, maxNegSamples, negSearchLimit,  margin):
         """
         This method is responsible for consuming a number of possible nodes from the graph and calculating loss from
         those nodes.
@@ -50,90 +51,6 @@ class AbstractLossGraph(object):
         pass
 
 
-class RMSELossGraph(AbstractLossGraph):
-    """
-    This loss function returns the root mean square error between the predictions and the true interactions.
-    Interactions can be any positive or negative values, and this loss function is sensitive to magnitude.
-    """
-    def connect_loss_graph(self, tf_prediction_serial, tf_interactions_serial, **kwargs):
-        return tf.sqrt(tf.reduce_mean(tf.square(tf_interactions_serial - tf_prediction_serial)))
-
-
-class RMSEDenseLossGraph(AbstractLossGraph):
-    """
-    This loss function returns the root mean square error between the predictions and the true interactions, including
-    all non-interacted values as 0s.
-    Interactions can be any positive or negative values, and this loss function is sensitive to magnitude.
-    """
-    is_dense = True
-
-    def connect_loss_graph(self, tf_interactions, tf_prediction, **kwargs):
-        error = tf.sparse_add(tf_interactions, -1.0 * tf_prediction)
-        return tf.sqrt(tf.reduce_mean(tf.square(error)))
-
-
-class SeparationLossGraph(AbstractLossGraph):
-    """
-    This loss function models the explicit positive and negative interaction predictions as normal distributions and
-    returns the probability of overlap between the two distributions.
-    Interactions can be any positive or negative values, but this loss function ignores the magnitude of the
-    interaction -- interactions are grouped in to {i <= 0} and {i > 0}.
-    """
-    def connect_loss_graph(self, tf_prediction_serial, tf_interactions_serial, **kwargs):
-
-        tf_positive_mask = tf.greater(tf_interactions_serial, 0.0)
-        tf_negative_mask = tf.less_equal(tf_interactions_serial, 0.0)
-
-        tf_positive_predictions = tf.boolean_mask(tf_prediction_serial, tf_positive_mask)
-        tf_negative_predictions = tf.boolean_mask(tf_prediction_serial, tf_negative_mask)
-
-        tf_pos_mean, tf_pos_var = tf.nn.moments(tf_positive_predictions, axes=[0])
-        tf_neg_mean, tf_neg_var = tf.nn.moments(tf_negative_predictions, axes=[0])
-
-        tf_overlap_distribution = tf.contrib.distributions.Normal(loc=(tf_neg_mean - tf_pos_mean),
-                                                                  scale=tf.sqrt(tf_neg_var + tf_pos_var))
-
-        loss = 1.0 - tf_overlap_distribution.cdf(0.0)
-        return loss
-
-
-class SeparationDenseLossGraph(AbstractLossGraph):
-    """
-    This loss function models all positive and negative interaction predictions as normal distributions and
-    returns the probability of overlap between the two distributions. This loss function includes non-interacted items
-    as negative interactions.
-    Interactions can be any positive or negative values, but this loss function ignores the magnitude of the
-    interaction -- interactions are grouped in to {i <= 0} and {i > 0}.
-    """
-    is_dense = True
-
-    def connect_loss_graph(self, tf_prediction, tf_interactions, **kwargs):
-
-        interactions_shape = tf.shape(tf_interactions)
-        int_serial_shape = tf.cast([interactions_shape[0] * interactions_shape[1]], tf.int32)
-        tf_interactions_serial = tf.reshape(tf.sparse_tensor_to_dense(tf_interactions),
-                                            shape=int_serial_shape)
-
-        prediction_shape = tf.shape(tf_prediction)
-        pred_serial_shape = tf.cast([prediction_shape[0] * prediction_shape[1]], tf.int32)
-        tf_prediction_serial = tf.reshape(tf_prediction, shape=pred_serial_shape)
-
-        tf_positive_mask = tf.greater(tf_interactions_serial, 0.0)
-        tf_negative_mask = tf.less_equal(tf_interactions_serial, 0.0)
-
-        tf_positive_predictions = tf.boolean_mask(tf_prediction_serial, tf_positive_mask)
-        tf_negative_predictions = tf.boolean_mask(tf_prediction_serial, tf_negative_mask)
-
-        tf_pos_mean, tf_pos_var = tf.nn.moments(tf_positive_predictions, axes=[0])
-        tf_neg_mean, tf_neg_var = tf.nn.moments(tf_negative_predictions, axes=[0])
-
-        tf_overlap_distribution = tf.contrib.distributions.Normal(loc=(tf_neg_mean - tf_pos_mean),
-                                                                  scale=tf.sqrt(tf_neg_var + tf_pos_var))
-
-        loss = 1.0 - tf_overlap_distribution.cdf(0.0)
-        return loss
-
-
 class WMRBLossGraph(AbstractLossGraph):
     """
     Approximation of http://ceur-ws.org/Vol-1905/recsys2017_poster3.pdf
@@ -141,87 +58,26 @@ class WMRBLossGraph(AbstractLossGraph):
     """
     is_sample_based = True
 
-    def connect_loss_graph(self, tf_prediction_serial, tf_interactions, tf_sample_predictions, tf_n_items,
-                           tf_n_sampled_items, **kwargs):
+    def connect_loss_graph(self, tr, prediction_graph_factory, tf_user_representation, pos_item_representation, tf_item_representation, tf_n_users, tf_n_items,
+                           tf_interaction_rows, tf_interaction_cols, maxNegSamples, negSearchLimit,  margin):
 
-        return self.weighted_margin_rank_batch(tf_prediction_serial=tf_prediction_serial,
-                                               tf_interactions=tf_interactions,
-                                               tf_sample_predictions=tf_sample_predictions,
-                                               tf_n_items=tf_n_items,
-                                               tf_n_sampled_items=tf_n_sampled_items)
+        def get_loss():
+            tf.Print(tf_user_representation, [tf.shape(tf_user_representation), tf.shape(tf_item_representation)])
 
-    def weighted_margin_rank_batch(self, tf_prediction_serial, tf_interactions, tf_sample_predictions, tf_n_items,
-                                   tf_n_sampled_items):
-        positive_interaction_mask = tf.greater(tf_interactions.values, 0.0)
-        positive_interaction_indices = tf.boolean_mask(tf_interactions.indices,
-                                                       positive_interaction_mask)
+            pos_prediction_score = prediction_graph_factory.connect_dense_prediction_graph(
+                tf_user_representation=tf_user_representation, tf_item_representation=pos_item_representation)
+            tr.dbg_nodes['pos_prediction_score'] = pos_prediction_score
 
-        # [ n_positive_interactions ]
-        positive_predictions = tf.boolean_mask(tf_prediction_serial,
-                                               positive_interaction_mask)
+            neg_repr = tf.gather(tf_item_representation, tf.random_uniform(shape=(negSearchLimit,), minval=0, maxval=tf_n_items, dtype=tf.int64), name='collect_neg_sample')
 
-        n_items = tf.cast(tf_n_items, dtype=tf.float32)
-        n_sampled_items = tf.cast(tf_n_sampled_items, dtype=tf.float32)
+            neg_prediction_score = prediction_graph_factory.connect_dense_prediction_graph(
+                tf_user_representation=tf_user_representation, tf_item_representation=neg_repr)
+            tr.dbg_nodes['neg_prediction_score'] = neg_prediction_score
 
-        # [ n_positive_interactions, n_sampled_items ]
-        mapped_predictions_sample_per_interaction = tf.gather(params=tf_sample_predictions,
-                                                              indices=tf.transpose(positive_interaction_indices)[0])
+            margin_score = neg_prediction_score - pos_prediction_score + margin
+            tf_positive_mask = tf.less(margin_score, 0.0)
+            loss_all = tf.boolean_mask(margin_score, tf_positive_mask)
+            # loss_topk,_ = tf.nn.top_k(loss_all, k=maxNegSamples, name='neg_top_k')
+            return tf.reduce_sum(loss_all)
 
-        # [ n_positive_interactions, n_sampled_items ]
-        summation_term = tf.maximum(1.0
-                                    - tf.expand_dims(positive_predictions, axis=1)
-                                    + mapped_predictions_sample_per_interaction,
-                                    0.0)
-
-        # [ n_positive_interactions ]
-        sampled_margin_rank = (n_items / n_sampled_items) * tf.reduce_sum(summation_term, axis=1)
-
-        loss = tf.log(sampled_margin_rank + 1.0)
-        return loss
-
-
-class BalancedWMRBLossGraph(WMRBLossGraph):
-    """
-    This loss graph extends WMRB by making it sensitive to interaction magnitude and weighting the loss of each item by
-    1 / sum(interactions) per item.
-    Interactions can be any positive values. Negative interactions are ignored.
-    """
-    def weighted_margin_rank_batch(self, tf_prediction_serial, tf_interactions, tf_sample_predictions, tf_n_items,
-                                   tf_n_sampled_items):
-        positive_interaction_mask = tf.greater(tf_interactions.values, 0.0)
-        positive_interaction_indices = tf.boolean_mask(tf_interactions.indices,
-                                                       positive_interaction_mask)
-        positive_interaction_values = tf.boolean_mask(tf_interactions.values,
-                                                      positive_interaction_mask)
-
-        positive_interactions = tf.SparseTensor(indices=positive_interaction_indices,
-                                                values=positive_interaction_values,
-                                                dense_shape=tf_interactions.dense_shape)
-        listening_sum_per_item = tf.sparse_reduce_sum(positive_interactions, axis=0)
-        gathered_sums = tf.gather(params=listening_sum_per_item,
-                                  indices=tf.transpose(positive_interaction_indices)[1])
-
-        # [ n_positive_interactions ]
-        positive_predictions = tf.boolean_mask(tf_prediction_serial,
-                                               positive_interaction_mask)
-
-        n_items = tf.cast(tf_n_items, dtype=tf.float32)
-        n_sampled_items = tf.cast(tf_n_sampled_items, dtype=tf.float32)
-
-        # [ n_positive_interactions, n_sampled_items ]
-        mapped_predictions_sample_per_interaction = tf.gather(params=tf_sample_predictions,
-                                                              indices=tf.transpose(positive_interaction_indices)[0])
-
-        # [ n_positive_interactions, n_sampled_items ]
-        summation_term = tf.maximum(1.0
-                                    - tf.expand_dims(positive_predictions, axis=1)
-                                    + mapped_predictions_sample_per_interaction,
-                                    0.0)
-
-        # [ n_positive_interactions ]
-        sampled_margin_rank = ((n_items / n_sampled_items)
-                               * tf.reduce_sum(summation_term, axis=1)
-                               * positive_interaction_values / gathered_sums)
-
-        loss = tf.log(sampled_margin_rank + 1.0)
-        return loss
+        return tf.cond(tf.equal(tf.size(tf_item_representation), 0), lambda : tf.constant(0., tf.float32), get_loss)

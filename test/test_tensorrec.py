@@ -140,29 +140,29 @@ class TensorRecTestCase(TestCase):
     def test_fit_fail_batching_dataset(self):
         model = TensorRec(n_components=10)
 
-        interactions_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions)
+        interactions_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions, False)
         with self.assertRaises(BatchNonSparseInputException):
             model.fit(interactions_as_dataset, self.user_features, self.item_features, epochs=10, user_batch_size=2)
 
     def test_fit_user_feature_as_dataset(self):
-        uf_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.user_features)
+        uf_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.user_features, False)
         model = TensorRec(n_components=10)
         model.fit(self.interactions, uf_as_dataset, self.item_features, epochs=10)
 
     def test_fit_item_feature_as_dataset(self):
-        if_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.item_features)
+        if_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.item_features, True)
         model = TensorRec(n_components=10)
         model.fit(self.interactions, self.user_features, if_as_dataset, epochs=10)
 
     def test_fit_interactions_as_dataset(self):
-        int_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions)
+        int_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions, False)
         model = TensorRec(n_components=10)
         model.fit(int_as_dataset, self.user_features, self.item_features, epochs=10)
 
     def test_fit_from_datasets(self):
-        uf_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.user_features)
-        if_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.item_features)
-        int_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions)
+        uf_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.user_features, False)
+        if_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.item_features, True)
+        int_as_dataset = create_tensorrec_dataset_from_sparse_matrix(self.interactions, False)
         model = TensorRec(n_components=10)
         model.fit(int_as_dataset, uf_as_dataset, if_as_dataset, epochs=10)
 

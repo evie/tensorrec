@@ -19,18 +19,21 @@ def create_tensorrec_iterator(name):
     )
 
 
-def create_tensorrec_dataset_from_sparse_matrix(sparse_matrix):
+def create_tensorrec_dataset_from_sparse_matrix(sparse_matrix, is_coo):
     """
     Creates a TensorFlow Dataset containing the data from the given sparse matrix.
     :param sparse_matrix: scipy.sparse matrix
     The data to be contained in this Dataset.
     :return: tf.data.Dataset
     """
-    if not isinstance(sparse_matrix, sp.coo_matrix):
+    if is_coo:
         sparse_matrix = sp.coo_matrix(sparse_matrix)
-
-    row_index = np.array([sparse_matrix.row], dtype=np.int64)
-    col_index = np.array([sparse_matrix.col], dtype=np.int64)
+        row_index = np.array([sparse_matrix.row], dtype=np.int64)
+        col_index = np.array([sparse_matrix.col], dtype=np.int64)
+    else:
+        sparse_matrix = sp.csr_matrix(sparse_matrix)
+        row_index = np.array([sparse_matrix.indptr], dtype=np.int64)
+        col_index = np.array([sparse_matrix.indices], dtype=np.int64)
     values = np.array([sparse_matrix.data], dtype=np.float32)
     n_dim_0 = np.array([sparse_matrix.shape[0]], dtype=np.int64)
     n_dim_1 = np.array([sparse_matrix.shape[1]], dtype=np.int64)
@@ -40,7 +43,7 @@ def create_tensorrec_dataset_from_sparse_matrix(sparse_matrix):
     return tf.data.Dataset.from_tensor_slices(tensor_slices)
 
 
-def write_tfrecord_from_sparse_matrix(tfrecord_path, sparse_matrix):
+def write_tfrecord_from_sparse_matrix(tfrecord_path, sparse_matrix, is_coo=True):
     """
     Writes the contents of a sparse matrix to a TFRecord file.
     :param tfrecord_path: str
@@ -48,7 +51,7 @@ def write_tfrecord_from_sparse_matrix(tfrecord_path, sparse_matrix):
     :return: str
     The tfrecord path
     """
-    dataset = create_tensorrec_dataset_from_sparse_matrix(sparse_matrix=sparse_matrix)
+    dataset = create_tensorrec_dataset_from_sparse_matrix(sparse_matrix=sparse_matrix, is_coo=is_coo)
     return write_tfrecord_from_tensorrec_dataset(tfrecord_path=tfrecord_path,
                                                  dataset=dataset)
 

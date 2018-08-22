@@ -65,13 +65,13 @@ def calculate_batched_alpha(num_batches, alpha):
     return batched_alpha
 
 
-def datasets_from_raw_input(raw_input):
+def datasets_from_raw_input(raw_input, is_coo):
 
     if isinstance(raw_input, tf.data.Dataset):
         return [raw_input]
 
     if sp.issparse(raw_input):
-        return [create_tensorrec_dataset_from_sparse_matrix(raw_input)]
+        return [create_tensorrec_dataset_from_sparse_matrix(raw_input, is_coo)]
 
     if isinstance(raw_input, six.string_types):
         return [create_tensorrec_dataset_from_tfrecord(raw_input)]
@@ -82,7 +82,7 @@ def datasets_from_raw_input(raw_input):
             return raw_input
 
         if all([sp.issparse(input_val) for input_val in raw_input]):
-            return [create_tensorrec_dataset_from_sparse_matrix(input_sparse_matrix)
+            return [create_tensorrec_dataset_from_sparse_matrix(input_sparse_matrix, is_coo)
                     for input_sparse_matrix in raw_input]
 
         if all([isinstance(input_val, six.string_types) for input_val in raw_input]):
@@ -112,9 +112,9 @@ def generate_dummy_data(num_users=15000, num_items=30000, interaction_density=.0
     item_features = sp.rand(num_items, num_item_features, density=float(n_features_per_item) / num_item_features)
 
     if return_datasets:
-        interactions = create_tensorrec_dataset_from_sparse_matrix(interactions)
-        user_features = create_tensorrec_dataset_from_sparse_matrix(user_features)
-        item_features = create_tensorrec_dataset_from_sparse_matrix(item_features)
+        interactions = create_tensorrec_dataset_from_sparse_matrix(interactions, False)
+        user_features = create_tensorrec_dataset_from_sparse_matrix(user_features, True)
+        item_features = create_tensorrec_dataset_from_sparse_matrix(item_features, True)
 
     return interactions, user_features, item_features
 

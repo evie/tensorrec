@@ -41,9 +41,9 @@ movies_to_plot = np.random.choice(a=item_features.shape[0], size=50, replace=Fal
 user_to_plot = np.random.choice(a=user_features.shape[0], size=100, replace=False)
 
 # Coerce data to datasets for faster fitting
-train_interactions_ds = create_tensorrec_dataset_from_sparse_matrix(train_interactions)
-user_features_ds = create_tensorrec_dataset_from_sparse_matrix(user_features)
-item_features_ds = create_tensorrec_dataset_from_sparse_matrix(item_features)
+train_interactions_ds = create_tensorrec_dataset_from_sparse_matrix(train_interactions, is_coo=False)
+user_features_ds = create_tensorrec_dataset_from_sparse_matrix(user_features, is_coo=True)
+item_features_ds = create_tensorrec_dataset_from_sparse_matrix(item_features, is_coo=True)
 
 # Iterate through 1000 epochs, outputting a JPG plot each epoch
 for epoch in range(epochs):

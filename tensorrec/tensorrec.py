@@ -12,8 +12,8 @@ from .errors import (
     TfVersionException
 )
 from .input_utils import create_tensorrec_iterator, get_dimensions_from_tensorrec_dataset
-from .loss_graphs import AbstractLossGraph, RMSELossGraph
-from .prediction_graphs import AbstractPredictionGraph, DotProductPredictionGraph
+from .loss_graphs import AbstractLossGraph, WMRBLossGraph
+from .prediction_graphs import AbstractPredictionGraph, CosineSimilarityPredictionGraph
 from .recommendation_graphs import (
     project_biases, split_sparse_tensor_indices, bias_prediction_dense, bias_prediction_serial, rank_predictions,
     densify_sampled_item_predictions, collapse_mixture_of_tastes, predict_similar_items
@@ -32,9 +32,9 @@ class TensorRec(object):
                  user_repr_graph=LinearRepresentationGraph(),
                  item_repr_graph=LinearRepresentationGraph(),
                  attention_graph=None,
-                 prediction_graph=DotProductPredictionGraph(),
-                 loss_graph=RMSELossGraph(),
-                 biased=True,
+                 prediction_graph=CosineSimilarityPredictionGraph(),
+                 loss_graph=WMRBLossGraph(),
+                 biased=False,
                  stratified_sample=False,
                  logdir='.',):
         """
@@ -100,19 +100,19 @@ class TensorRec(object):
         self.biased = biased
         self.stratified_sample = stratified_sample
         self.logdir = logdir
+        self.dbg_nodes = {}
 
         # A list of the attr names of every graph hook attr
         self.graph_tensor_hook_attr_names = [
 
             # Top-level API nodes
-            'tf_user_representation', 'tf_item_representation', 'tf_prediction_serial', 'tf_prediction', 'tf_rankings',
-            'tf_predict_similar_items', 'tf_rank_similar_items',
+            'tf_user_representation', 'tf_item_representation',
 
             # Training nodes
             'tf_basic_loss', 'tf_weight_reg_loss', 'tf_loss',
 
             # Feed placeholders
-            'tf_learning_rate', 'tf_alpha', 'tf_sample_indices', 'tf_n_sampled_items', 'tf_similar_items_ids',
+            'tf_learning_rate', 'tf_alpha',
         ]
         if self.biased:
             self.graph_tensor_hook_attr_names += ['tf_projected_user_biases', 'tf_projected_item_biases']
@@ -249,21 +249,21 @@ class TensorRec(object):
         initializers = []
 
         if interactions is not None:
-            interactions_datasets = datasets_from_raw_input(raw_input=interactions)
+            interactions_datasets = datasets_from_raw_input(raw_input=interactions, is_coo=False)
             interactions_initializers = [self.tf_interaction_iterator.make_initializer(dataset)
                                          for dataset in interactions_datasets]
             datasets.append(interactions_datasets)
             initializers.append(interactions_initializers)
 
         if user_features is not None:
-            user_features_datasets = datasets_from_raw_input(raw_input=user_features)
+            user_features_datasets = datasets_from_raw_input(raw_input=user_features, is_coo=True)
             user_features_initializers = [self.tf_user_feature_iterator.make_initializer(dataset)
                                           for dataset in user_features_datasets]
             datasets.append(user_features_datasets)
             initializers.append(user_features_initializers)
 
         if item_features is not None:
-            item_features_datasets = datasets_from_raw_input(raw_input=item_features)
+            item_features_datasets = datasets_from_raw_input(raw_input=item_features, is_coo=True)
             item_features_initializers = [self.tf_item_feature_iterator.make_initializer(dataset)
                                           for dataset in item_features_datasets]
             datasets.append(item_features_datasets)
@@ -289,39 +289,23 @@ class TensorRec(object):
 
         tf_user_feature_rows, tf_user_feature_cols, tf_user_feature_values, tf_n_users, _ = \
             self.tf_user_feature_iterator.get_next()
-        tf_item_feature_rows, tf_item_feature_cols, tf_item_feature_values, tf_n_items, _ = \
-            self.tf_item_feature_iterator.get_next()
         tf_interaction_rows, tf_interaction_cols, tf_interaction_values, _, _ = \
             self.tf_interaction_iterator.get_next()
 
         tf_user_feature_indices = tf.stack([tf_user_feature_rows, tf_user_feature_cols], axis=1)
-        tf_item_feature_indices = tf.stack([tf_item_feature_rows, tf_item_feature_cols], axis=1)
-        tf_interaction_indices = tf.stack([tf_interaction_rows, tf_interaction_cols], axis=1)
 
         # Construct the features and interactions as sparse matrices
         tf_user_features = tf.SparseTensor(tf_user_feature_indices, tf_user_feature_values,
                                            [tf_n_users, n_user_features])
-        tf_item_features = tf.SparseTensor(tf_item_feature_indices, tf_item_feature_values,
-                                           [tf_n_items, n_item_features])
-        tf_interactions = tf.SparseTensor(tf_interaction_indices, tf_interaction_values,
-                                          [tf_n_users, tf_n_items])
-
-        if self.stratified_sample:
-            sample_items_partial = partial(sample_items_stratified, replace=self.loss_graph_factory.is_sampled_with_replacement)
-            self.tf_sample_indices = tf.py_func(func=sample_items_partial,
-                                                inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items,
-                                                     tf_interaction_rows, tf_interaction_cols, tf_interaction_values],
-                                                Tout=tf.int64)
-        else:
-            sample_items_partial = partial(sample_items, replace=self.loss_graph_factory.is_sampled_with_replacement)
-            self.tf_sample_indices = tf.py_func(func=sample_items_partial,
-                                                inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items],
-                                                Tout=tf.int64)
-        self.tf_sample_indices.set_shape([None, None])
 
         # Collect the weights for regularization
-        tf_weights = []
+        tf_item_feature_rows, tf_item_feature_cols, tf_item_feature_values, tf_n_items, _ = \
+            self.tf_item_feature_iterator.get_next()
+        tf_item_feature_indices = tf.stack([tf_item_feature_rows, tf_item_feature_cols], axis=1)
+        tf_item_features = tf.SparseTensor(tf_item_feature_indices, tf_item_feature_values,
+                                           [tf_n_items, n_item_features])
 
+        tf_weights = []
         # Build the item representations
         self.tf_item_representation, item_weights = \
             self.item_repr_graph_factory.connect_representation_graph(tf_features=tf_item_features,
@@ -330,174 +314,52 @@ class TensorRec(object):
                                                                       node_name_ending='item')
         tf_weights.extend(item_weights)
 
-        tf_x_user, tf_x_item = split_sparse_tensor_indices(tf_sparse_tensor=tf_interactions, n_dimensions=2)
-        tf_transposed_sample_indices = tf.transpose(self.tf_sample_indices)
-        tf_x_user_sample = tf_transposed_sample_indices[0]
-        tf_x_item_sample = tf_transposed_sample_indices[1]
 
-        # These lists will hold the reprs and predictions for each taste
-        tastes_tf_user_representations = []
-        tastes_tf_predictions = []
-        tastes_tf_prediction_serials = []
-        tastes_tf_sample_prediction_serials = []
+        def get_positive_item(tf_interaction_rows, tf_interaction_cols):
+            indices = tf.random_shuffle(tf.range(tf.shape(tf_interaction_cols)[0]))
+            pos_cols = tf.gather(tf_interaction_cols, indices[0])
+            user_cols = tf.gather(tf_interaction_cols, indices[1:])
+            tf.Print(pos_cols, [pos_cols, user_cols], message="get_positive_item")
+            return pos_cols, user_cols
 
-        # If this model does not use attention, Nones are used as sentinels in place of the attentions
-        if self.attention_graph_factory is not None:
-            tastes_tf_attentions = []
-            tastes_tf_attention_serials = []
-            tastes_tf_sample_attention_serials = []
-            tastes_tf_attention_representations = []
-        else:
-            tastes_tf_attentions = None
-            tastes_tf_attention_serials = None
-            tastes_tf_sample_attention_serials = None
-            tastes_tf_attention_representations = None
+        pos_cols, user_cols = get_positive_item(tf_interaction_rows, tf_interaction_cols)
+        self.dbg_nodes['pos_cols'] = pos_cols
+        self.dbg_nodes['user_cols'] = user_cols
+        # user representation
+        ## user interation history representation
+        user_interaction_items_repr = tf.reduce_sum(tf.nn.embedding_lookup(self.tf_item_representation,
+                                                                            user_cols,
+                                                                            name='lookup_interaction'), axis=0)
 
-        # Build n_tastes user representations and predictions
-        for taste in range(self.n_tastes):
-            tf_user_representation, user_weights = \
-                self.user_repr_graph_factory.connect_representation_graph(tf_features=tf_user_features,
-                                                                          n_components=self.n_components,
-                                                                          n_features=n_user_features,
-                                                                          node_name_ending='user_{}'.format(taste))
-            tastes_tf_user_representations.append(tf_user_representation)
-            tf_weights.extend(user_weights)
+        tf_user_representation_feature, user_weights = self.user_repr_graph_factory.connect_representation_graph(
+            tf_features=tf_user_features, n_components=self.n_components, n_features=n_user_features,
+            node_name_ending='user_{}'.format(0))
+        tf_weights.extend(user_weights)
 
-            # Connect attention, if applicable
-            if self.attention_graph_factory is not None:
-                tf_attention_representation, attention_weights = \
-                    self.attention_graph_factory.connect_representation_graph(tf_features=tf_user_features,
-                                                                              n_components=self.n_components,
-                                                                              n_features=n_user_features,
-                                                                              node_name_ending='attn_{}'.format(taste))
-                tf_weights.extend(attention_weights)
+        self.tf_user_representation = tf_user_representation_feature + user_interaction_items_repr
+        pos_item_representation = tf.reshape(tf.gather(self.tf_item_representation, pos_cols, name='get_positive_item'), shape=(1,-1))
+        self.dbg_nodes['tf_user_representation'] = self.tf_user_representation
+        self.dbg_nodes['pos_item_representation'] = pos_item_representation
+        self.dbg_nodes['tf_user_representation_feature'] = tf_user_representation_feature
 
-                tf_attention = self.prediction_graph_factory.connect_dense_prediction_graph(
-                    tf_user_representation=tf_attention_representation,
-                    tf_item_representation=self.tf_item_representation
-                )
-                tf_attention_serial = self.prediction_graph_factory.connect_serial_prediction_graph(
-                    tf_user_representation=tf_attention_representation,
-                    tf_item_representation=self.tf_item_representation,
-                    tf_x_user=tf_x_user,
-                    tf_x_item=tf_x_item,
-                )
-                tf_sample_attention_serial = self.prediction_graph_factory.connect_serial_prediction_graph(
-                    tf_user_representation=tf_user_representation,
-                    tf_item_representation=self.tf_item_representation,
-                    tf_x_user=tf_x_user_sample,
-                    tf_x_item=tf_x_item_sample,
-                )
-
-                tastes_tf_attentions.append(tf_attention)
-                tastes_tf_attention_serials.append(tf_attention_serial)
-                tastes_tf_sample_attention_serials.append(tf_sample_attention_serial)
-                tastes_tf_attention_representations.append(tf_attention_representation)
-
-            # Connect the configurable prediction graphs for each taste
-            tf_prediction = self.prediction_graph_factory.connect_dense_prediction_graph(
-                tf_user_representation=tf_user_representation,
-                tf_item_representation=self.tf_item_representation
-            )
-            tf_prediction_serial = self.prediction_graph_factory.connect_serial_prediction_graph(
-                tf_user_representation=tf_user_representation,
-                tf_item_representation=self.tf_item_representation,
-                tf_x_user=tf_x_user,
-                tf_x_item=tf_x_item,
-            )
-            tf_sample_predictions_serial = self.prediction_graph_factory.connect_serial_prediction_graph(
-                tf_user_representation=tf_user_representation,
-                tf_item_representation=self.tf_item_representation,
-                tf_x_user=tf_x_user_sample,
-                tf_x_item=tf_x_item_sample,
-            )
-
-            # Append to tastes
-            tastes_tf_predictions.append(tf_prediction)
-            tastes_tf_prediction_serials.append(tf_prediction_serial)
-            tastes_tf_sample_prediction_serials.append(tf_sample_predictions_serial)
-
-        # If attention is in the graph, build the API node
-        if self.attention_graph_factory is not None:
-            self.tf_user_attention_representation = tf.stack(tastes_tf_attention_representations)
-
-        self.tf_user_representation = tf.stack(tastes_tf_user_representations)
-        self.tf_prediction = collapse_mixture_of_tastes(
-            tastes_predictions=tastes_tf_predictions,
-            tastes_attentions=tastes_tf_attentions
-        )
-        self.tf_prediction_serial = collapse_mixture_of_tastes(
-            tastes_predictions=tastes_tf_prediction_serials,
-            tastes_attentions=tastes_tf_attention_serials
-        )
-        tf_sample_predictions_serial = collapse_mixture_of_tastes(
-            tastes_predictions=tastes_tf_sample_prediction_serials,
-            tastes_attentions=tastes_tf_sample_attention_serials
-        )
-
-        # Add biases, if this is a biased estimator
-        if self.biased:
-            tf_user_feature_biases, self.tf_projected_user_biases = project_biases(
-                tf_features=tf_user_features, n_features=n_user_features
-            )
-            tf_item_feature_biases, self.tf_projected_item_biases = project_biases(
-                tf_features=tf_item_features, n_features=n_item_features
-            )
-
-            tf_weights.append(tf_user_feature_biases)
-            tf_weights.append(tf_item_feature_biases)
-
-            self.tf_prediction = bias_prediction_dense(
-                tf_prediction=self.tf_prediction,
-                tf_projected_user_biases=self.tf_projected_user_biases,
-                tf_projected_item_biases=self.tf_projected_item_biases)
-
-            self.tf_prediction_serial = bias_prediction_serial(
-                tf_prediction_serial=self.tf_prediction_serial,
-                tf_projected_user_biases=self.tf_projected_user_biases,
-                tf_projected_item_biases=self.tf_projected_item_biases,
-                tf_x_user=tf_x_user,
-                tf_x_item=tf_x_item)
-
-            tf_sample_predictions_serial = bias_prediction_serial(
-                tf_prediction_serial=tf_sample_predictions_serial,
-                tf_projected_user_biases=self.tf_projected_user_biases,
-                tf_projected_item_biases=self.tf_projected_item_biases,
-                tf_x_user=tf_x_user_sample,
-                tf_x_item=tf_x_item_sample)
-
-        tf_interactions_serial = tf_interactions.values
-
-        # Construct API nodes
-        self.tf_rankings = rank_predictions(tf_prediction=self.tf_prediction)
-        self.tf_predict_similar_items = predict_similar_items(prediction_graph_factory=self.prediction_graph_factory,
-                                                              tf_item_representation=self.tf_item_representation,
-                                                              tf_similar_items_ids=self.tf_similar_items_ids)
-        self.tf_rank_similar_items = rank_predictions(tf_prediction=self.tf_predict_similar_items)
 
         # Compose loss function args
         # This composition is for execution safety: it prevents loss functions that are incorrectly configured from
         # having visibility of certain nodes.
         loss_graph_kwargs = {
-            'tf_prediction_serial': self.tf_prediction_serial,
-            'tf_interactions_serial': tf_interactions_serial,
-            'tf_interactions': tf_interactions,
+            'prediction_graph_factory': self.prediction_graph_factory,
+            'tf_user_representation': self.tf_user_representation,
+            'tf_item_representation': self.tf_item_representation,
+            'pos_item_representation': pos_item_representation,
+            'tf_interaction_rows': tf_interaction_rows,
+            'tf_interaction_cols': tf_interaction_cols,
             'tf_n_users': tf_n_users,
             'tf_n_items': tf_n_items,
+            'maxNegSamples': 5,
+            'negSearchLimit': 100,
+            'margin': 0.2,
+            'tr': self
         }
-        if self.loss_graph_factory.is_dense:
-            loss_graph_kwargs.update({
-                'tf_prediction': self.tf_prediction,
-                'tf_rankings': self.tf_rankings,
-            })
-        if self.loss_graph_factory.is_sample_based:
-            tf_sample_predictions = densify_sampled_item_predictions(
-                tf_sample_predictions_serial=tf_sample_predictions_serial,
-                tf_n_sampled_items=self.tf_n_sampled_items,
-                tf_n_users=tf_n_users,
-            )
-            loss_graph_kwargs.update({'tf_sample_predictions': tf_sample_predictions,
-                                      'tf_n_sampled_items': self.tf_n_sampled_items})
 
         # Build loss graph
         self.tf_basic_loss = self.loss_graph_factory.connect_loss_graph(**loss_graph_kwargs)
@@ -611,7 +473,7 @@ class TensorRec(object):
 
         # Check if the graph has been constructed by checking the dense prediction node
         # If it hasn't been constructed, initialize it
-        if self.tf_prediction is None:
+        if True: #self.tf_prediction is None:
 
             memory_var = tf.Variable(get_memory() / 1000000000, name='memory', trainable=False)
 
@@ -640,7 +502,7 @@ class TensorRec(object):
         with tf.name_scope('training'):
             tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
             tf.summary.scalar('mean_loss', tf.reduce_mean(self.tf_basic_loss))
-            tf.summary.scalar('mean_pred', tf.reduce_mean(self.tf_prediction_serial))
+            # tf.summary.scalar('mean_pred', tf.reduce_mean(self.tf_prediction_serial))
             tf.summary.scalar('memory', memory_var)
         merged = tf.summary.merge_all()
         train_writer = tf.summary.FileWriter(self.logdir + '/train', session.graph)
@@ -652,13 +514,14 @@ class TensorRec(object):
                     session.run(self.tf_optimizer, feed_dict=feed_dict)
 
                 else:
-                    _, _, loss, serial_predictions, wr_loss, summary = session.run(
-                        [memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_prediction_serial, self.tf_weight_reg_loss,
+                    _, _, loss, wr_loss, summary = session.run(
+                        [memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_weight_reg_loss,
                          merged],
                         feed_dict=feed_dict
                     )
                     mean_loss = np.mean(loss)
-                    mean_pred = np.mean(serial_predictions)
+                    # mean_pred = np.mean(serial_predictions)
+                    mean_pred = 0
                     weight_reg_l2_loss = alpha * wr_loss
 
                     train_writer.add_summary(summary, epoch*len(initializer_sets) + batch)
@@ -666,6 +529,8 @@ class TensorRec(object):
                     logging.info('EPOCH {} BATCH {} loss = {}, weight_reg_l2_loss = {}, mean_pred = {}'.format(
                         epoch, batch, mean_loss, weight_reg_l2_loss, mean_pred
                     ))
+
+
     def predict(self, user_features, item_features):
         """
         Predict recommendation scores for the given users and items.
