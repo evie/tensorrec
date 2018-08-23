@@ -37,10 +37,11 @@ class LinearRepresentationGraph(AbstractRepresentationGraph):
 
         # Create variable nodes
         tf_linear_weights = tf.Variable(normalized_weights, name='weights_{}'.format(node_name_ending))
-        if lookup:
-            tf_repr = tf.reshape(tf.reduce_sum(tf.gather(tf_linear_weights, tf_features),axis=0), shape=(1,-1))
-        else:
-            tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
+        with tf.name_scope('repr_{}'.format(node_name_ending)):
+            if lookup:
+                tf_repr = tf.reshape(tf.reduce_sum(tf.gather(tf_linear_weights, tf_features),axis=0), shape=(1,-1))
+            else:
+                tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
 
         # Return repr layer and variables
         return tf_repr, [tf_linear_weights]

@@ -2,7 +2,7 @@ from functools import partial
 from itertools import cycle
 import logging
 import numpy as np
-import os
+import os,sys
 import pickle
 from scipy import sparse as sp
 import tensorflow as tf
@@ -124,8 +124,9 @@ class TensorRec(object):
             item_features = item_features.tocoo()
             tf_item_feature_indices = tf.stack([tf.constant(item_features.row, dtype=tf.int64),
                                                 tf.constant(item_features.col, dtype=tf.int64)], axis=1)
-            tf_item_features = tf.SparseTensor(tf_item_feature_indices, tf.constant(item_features.data,
-                                                            dtype=tf.float32), item_features.shape)
+            tf_item_features = tf.SparseTensor(tf_item_feature_indices,
+                                               tf.constant(item_features.data,dtype=tf.float32),
+                                               item_features.shape)
 
         # item and user variables
         self.tf_item_representation, item_weights = \
@@ -173,26 +174,27 @@ class TensorRec(object):
         # Compose loss function args
         # This composition is for execution safety: it prevents loss functions that are incorrectly configured from
         # having visibility of certain nodes.
-        with tf.name_scope('get_loss'):
-            loss_graph_kwargs = {
-                'prediction_graph_factory': self.prediction_graph_factory,
-                'tf_user_representation': self.tf_user_representation,
-                'tf_item_representation': self.tf_item_representation,
-                'pos_item_representation': pos_item_representation,
-                'tf_interaction_cols': self.tf_interaction_cols,
-                'maxNegSamples': 5, # not used
-                'negSearchLimit': 100,
-                'margin': self.margin,
-                'tr': self
-            }
+        loss_graph_kwargs = {
+            'prediction_graph_factory': self.prediction_graph_factory,
+            'tf_user_representation': self.tf_user_representation,
+            'tf_item_representation': self.tf_item_representation,
+            'pos_item_representation': pos_item_representation,
+            'tf_interaction_cols': self.tf_interaction_cols,
+            'maxNegSamples': 5, # not used
+            'negSearchLimit': 100,
+            'margin': self.margin,
+            'tr': self
+        }
 
-            # Build loss graph
+        # Build loss graph
+        with tf.name_scope('basic_loss'):
             self.tf_basic_loss = self.loss_graph_factory.connect_loss_graph(**loss_graph_kwargs)
-
+        with tf.name_scope('reg_loss'):
             self.tf_weight_reg_loss = sum(tf.nn.l2_loss(weights) for weights in tf_weights)
+        with tf.name_scope('loss'):
             self.tf_loss = self.tf_basic_loss + (self.tf_alpha * self.tf_weight_reg_loss)
-
-        self.tf_optimizer = tf.train.AdamOptimizer(learning_rate=self.tf_learning_rate).minimize(self.tf_loss)
+        with tf.name_scope('optimizer'):
+            self.tf_optimizer = tf.train.AdamOptimizer(learning_rate=self.tf_learning_rate).minimize(self.tf_loss)
         # Record the new node names
 
     def fit(self, interactions, user_features, item_features, epochs=100, learning_rate=0.1, alpha=0.00001,
@@ -316,7 +318,7 @@ class TensorRec(object):
                 feed_dict[self.tf_interaction_cols] = interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]]
                 if not verbose:
                     session.run(self.tf_optimizer, feed_dict=feed_dict)
-
+                    sys.stdout.write('training epoch %s, batch %s \r' % (epoch, u))
                 else:
                     _, _, loss, wr_loss, summary = session.run(
                         [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_weight_reg_loss,

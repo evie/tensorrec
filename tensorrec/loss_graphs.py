@@ -80,4 +80,4 @@ class WMRBLossGraph(AbstractLossGraph):
                 tr.graph_nodes['margin_score'] = margin_score
             return tf.reduce_sum(loss_all)
 
-        return tf.cond(tf.equal(tf.size(tf_item_representation), 0), lambda : tf.constant(0., tf.float32), get_loss)
+        return tf.cond(tf.equal(tf.size(tf_item_representation), 0), lambda : tf.constant(0., tf.float32), get_loss, name='cond_empty')
