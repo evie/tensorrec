@@ -78,6 +78,6 @@ class WMRBLossGraph(AbstractLossGraph):
                 tf_positive_mask = tf.greater(margin_score, 0.0)
                 loss_all = tf.boolean_mask(margin_score, tf_positive_mask)
                 tr.graph_nodes['margin_score'] = margin_score
-            return tf.reduce_sum(loss_all)
+            return tf.reduce_sum(loss_all)/negSearchLimit
 
         return tf.cond(tf.equal(tf.size(tf_item_representation), 0), lambda : tf.constant(0., tf.float32), get_loss, name='cond_empty')

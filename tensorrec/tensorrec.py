@@ -5,6 +5,7 @@ import numpy as np
 import os,sys
 import pickle
 from scipy import sparse as sp
+import time
 import tensorflow as tf
 
 from .errors import (
@@ -36,6 +37,7 @@ class TensorRec(object):
                  loss_graph=WMRBLossGraph(),
                  biased=False,
                  stratified_sample=False,
+                 log_interval=100,
                  logdir='.',):
         """
         A TensorRec recommendation model.
@@ -99,6 +101,7 @@ class TensorRec(object):
         self.loss_graph_factory = loss_graph
         self.biased = biased
         self.stratified_sample = stratified_sample
+        self.log_interval = log_interval
         self.logdir = logdir
         self.graph_nodes = {}
         self.memory_var = None
@@ -121,27 +124,35 @@ class TensorRec(object):
         tf_weights = []
         # Build all items representations
         with tf.name_scope('init_item_sparse_tensor'):
-            item_features = item_features.tocoo()
-            tf_item_feature_indices = tf.stack([tf.constant(item_features.row, dtype=tf.int64),
-                                                tf.constant(item_features.col, dtype=tf.int64)], axis=1)
-            tf_item_features = tf.SparseTensor(tf_item_feature_indices,
-                                               tf.constant(item_features.data,dtype=tf.float32),
-                                               item_features.shape)
+            item_representation_list = []
+            for r in range(item_features.shape[0]):
+                row = item_features.getrow(r)
+                # print 'creating %sth item tensor' % r
+                # item and user variables
+                item_weights = self.graph_nodes.get('item_weights')
+                item_representation, item_weights = \
+                    self.item_repr_graph_factory.connect_representation_graph(feature_weights=[item_weights],
+                                                                              tf_features=row.indices,
+                                                                              n_components=self.n_components,
+                                                                              n_features=n_item_features,
+                                                                              node_name_ending='item',
+                                                                              lookup=True)
+                self.graph_nodes['item_weights'] = item_weights[0]
+                item_representation_list.append(tf.reshape(item_representation, shape=(-1,)))
+            self.tf_item_representation = tf.stack(item_representation_list)
+            tf_weights.extend(item_weights)
+            print 'tf_item_representation', self.tf_item_representation
+            print 'item_weights', item_weights[0]
 
-        # item and user variables
-        self.tf_item_representation, item_weights = \
-            self.item_repr_graph_factory.connect_representation_graph(tf_features=tf_item_features,
-                                                                      n_components=self.n_components,
-                                                                      n_features=n_item_features,
-                                                                      node_name_ending='item')
-        tf_weights.extend(item_weights)
-        self.graph_nodes['item_weights'] = item_weights
-
+        user_weights = self.graph_nodes.get('user_weights')
         tf_user_representation_feature, user_weights = self.user_repr_graph_factory.connect_representation_graph(
+            feature_weights=[user_weights],
             tf_features=self.tf_user_feature_cols, n_components=self.n_components, n_features=n_user_features,
             node_name_ending='user', lookup=True)
         tf_weights.extend(user_weights)
-        self.graph_nodes['user_weights'] = user_weights
+        self.graph_nodes['user_weights'] = user_weights[0]
+        print 'tf_user_representation_feature', tf_user_representation_feature
+        print 'user_weights', user_weights[0]
 
         with tf.name_scope('get_pos_item'):
             def get_positive_item(tf_interaction_cols):
@@ -155,16 +166,18 @@ class TensorRec(object):
             self.graph_nodes['user_cols'] = user_cols
         with tf.name_scope('pos_example'):
             pos_item_representation = tf.reshape(tf.gather(self.tf_item_representation, pos_cols, name='get_positive_item'), shape=(1,-1))
+            print 'pos_item_representation', pos_item_representation
 
         # user representation
         # user interation history representation
 
-        with tf.name_scope('user_repr'):
+        with tf.name_scope('final_user_repr'):
             user_interaction_items_repr = tf.reduce_sum(tf.nn.embedding_lookup(self.tf_item_representation,
                                                                                 user_cols,
                                                                                 name='lookup_interaction'), axis=0)
-
             self.tf_user_representation = tf_user_representation_feature + user_interaction_items_repr
+            print 'user_interaction_items_repr', user_interaction_items_repr
+            print 'self.tf_user_representation', self.tf_user_representation
 
         self.graph_nodes['tf_user_representation'] = self.tf_user_representation
         self.graph_nodes['pos_item_representation'] = pos_item_representation
@@ -181,7 +194,7 @@ class TensorRec(object):
             'pos_item_representation': pos_item_representation,
             'tf_interaction_cols': self.tf_interaction_cols,
             'maxNegSamples': 5, # not used
-            'negSearchLimit': 100,
+            'negSearchLimit': 88,
             'margin': self.margin,
             'tr': self
         }
@@ -282,6 +295,7 @@ class TensorRec(object):
         # Check input dimensions
         n_users, n_user_features = user_features.shape
         n_items, n_item_features = item_features.shape
+        print 'n_users, n_user_features, n_items, n_item_features', n_users, n_user_features, n_items, n_item_features
 
         # Check if the graph has been constructed by checking the dense prediction node
         # If it hasn't been constructed, initialize it
@@ -303,36 +317,47 @@ class TensorRec(object):
 
         with tf.name_scope('log_item_weights'):
             variable_summaries(self.graph_nodes['item_weights'])
+        with tf.name_scope('log_user_weights'):
+            variable_summaries(self.graph_nodes['user_weights'])
         with tf.name_scope('log_training'):
             tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
             tf.summary.scalar('mean_loss', tf.reduce_mean(self.tf_basic_loss))
             tf.summary.scalar('memory', self.memory_var)
         merged = tf.summary.merge_all()
-        train_writer = tf.summary.FileWriter(self.logdir + '/train', session.graph)
+        train_writer = tf.summary.FileWriter(self.logdir +
+                                        '/train'+time.strftime('%x-%X').replace('/','').replace(':',''), session.graph)
 
         user_features = user_features.tocsr()
         interactions = interactions.tocsr()
+        last_item_weights = None
         for epoch in range(epochs):
             for u in xrange(interactions.shape[0]):
+                step = epoch*n_users + u
                 feed_dict[self.tf_user_feature_cols] = user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]]
                 feed_dict[self.tf_interaction_cols] = interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]]
-                if not verbose:
+                if not verbose or step % self.log_interval:
                     session.run(self.tf_optimizer, feed_dict=feed_dict)
-                    sys.stdout.write('training epoch %s, batch %s \r' % (epoch, u))
+                    if step % 100 == 99:
+                        sys.stdout.write('\r training epoch %s, batch %s ' % (epoch, u))
                 else:
-                    _, _, loss, wr_loss, summary = session.run(
+                    _, _, loss, wr_loss, summary, item_weights = session.run(
                         [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_weight_reg_loss,
-                         merged],
+                         merged, self.graph_nodes['item_weights']],
                         feed_dict=feed_dict
                     )
-                    if u%1 == 0:
-                        mean_loss = np.mean(loss)
-                        weight_reg_l2_loss = alpha * wr_loss
-                        train_writer.add_summary(summary, epoch*n_users + u)
-                        out_str = 'EPOCH {} user_cnt {} loss = {}, weight_reg_l2_loss = {}'.format(
-                            epoch, u, mean_loss, weight_reg_l2_loss)
-                        logging.info(out_str)
-                        print out_str
+                    mean_loss = np.mean(loss)
+                    weight_reg_l2_loss = alpha * wr_loss
+                    train_writer.add_summary(summary, step)
+                    out_str = 'EPOCH {} user_cnt {} loss = {}, weight_reg_l2_loss = {}'.format(
+                        epoch, u, mean_loss, weight_reg_l2_loss)
+
+                    if last_item_weights is not None:
+                        interact_words = set(item_features.tocsr()[feed_dict[self.tf_interaction_cols]].indices)
+                        print 'number of updated words, interaction words', np.sum((np.sum(item_weights, axis=1) - np.sum(last_item_weights, axis=1))!=0), len(interact_words)
+                    last_item_weights = item_weights
+
+
+                    print out_str
 
 
 

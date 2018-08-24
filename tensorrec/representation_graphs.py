@@ -6,7 +6,7 @@ class AbstractRepresentationGraph(object):
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def connect_representation_graph(self, tf_features, n_components, n_features, node_name_ending):
+    def connect_representation_graph(self, tf_linear_weights, tf_features, n_components, n_features, node_name_ending):
         """
         This method is responsible for connecting the user/item features to their respective latent representations.
         :param tf_features: tf.SparseTensor
@@ -29,19 +29,23 @@ class LinearRepresentationGraph(AbstractRepresentationGraph):
     Rough approximation of http://ceur-ws.org/Vol-1448/paper4.pdf
     """
 
-    def connect_representation_graph(self, tf_features, n_components, n_features, node_name_ending, lookup=False):
+    def connect_representation_graph(self, feature_weights, tf_features, n_components, n_features, node_name_ending, lookup=False):
 
         # Weights are normalized before building the variable
-        raw_weights = tf.random_normal([n_features, n_components], stddev=1.0, name='raw_weights')
-        normalized_weights = tf.nn.l2_normalize(raw_weights, 1)
-
-        # Create variable nodes
-        tf_linear_weights = tf.Variable(normalized_weights, name='weights_{}'.format(node_name_ending))
+        if feature_weights[0] is None:
+            raw_weights = tf.random_normal([n_features, n_components], stddev=1.0, name='raw_weights')
+            normalized_weights = tf.nn.l2_normalize(raw_weights, 1)
+            # Create variable nodes
+            # tf_linear_weights = tf.get_variable(name='weights_{}'.format(node_name_ending), initializer=normalized_weights)
+            tf_linear_weights = tf.Variable(normalized_weights, name='weights_{}'.format(node_name_ending))
+        else:
+            tf_linear_weights = feature_weights[0]
         with tf.name_scope('repr_{}'.format(node_name_ending)):
             if lookup:
                 tf_repr = tf.reshape(tf.reduce_sum(tf.gather(tf_linear_weights, tf_features),axis=0), shape=(1,-1))
             else:
-                tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
+                tf_repr = tf.stack([tf.gather(tf_linear_weights, i) for i in len(tf_features)])
+                # tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
 
         # Return repr layer and variables
         return tf_repr, [tf_linear_weights]
@@ -60,37 +64,6 @@ class NormalizedLinearRepresentationGraph(LinearRepresentationGraph):
         )
         normalized_repr = tf.nn.l2_normalize(tf_repr, 1)
         return normalized_repr, weights_list
-
-
-class FeaturePassThroughRepresentationGraph(AbstractRepresentationGraph):
-    """
-    Uses the features as the representation. This representation graph does no transformation to the features.
-    """
-
-    def connect_representation_graph(self, tf_features, n_components, n_features, node_name_ending):
-
-        if n_components != n_features:
-            raise ValueError('{} requires n_features and n_components to be equal. Either adjust n_components or use a '
-                             'different representation graph. n_features = {}, n_components = {}'.format(
-                                self.__class__.__name__, n_features, n_components
-                             ))
-
-        return tf.sparse_tensor_to_dense(tf_features, validate_indices=False), []
-
-
-class WeightedFeaturePassThroughRepresentationGraph(FeaturePassThroughRepresentationGraph):
-    """
-    Uses the features as the representation. This representation graph learns weights for each feature.
-    """
-
-    def connect_representation_graph(self, tf_features, n_components, n_features, node_name_ending):
-        dense_repr, _ = super(WeightedFeaturePassThroughRepresentationGraph, self).connect_representation_graph(
-            tf_features=tf_features, n_components=n_components, n_features=n_features, node_name_ending=node_name_ending
-        )
-
-        weights = tf.ones([1, n_components])
-        weighted_repr = tf.multiply(dense_repr, weights)
-        return weighted_repr, [weights]
 
 
 class ReLURepresentationGraph(AbstractRepresentationGraph):

@@ -191,7 +191,7 @@ class lazyval(object):
 
 def variable_summaries(var):
   """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
-  with tf.name_scope('summaries'):
+  with tf.name_scope('vars_summaries'):
     mean = tf.reduce_mean(var)
     tf.summary.scalar('mean', mean)
     with tf.name_scope('stddev'):
