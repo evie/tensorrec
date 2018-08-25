@@ -123,26 +123,27 @@ class TensorRec(object):
 
         tf_weights = []
         # Build all items representations
+        # Build all items representations
         with tf.name_scope('init_item_sparse_tensor'):
-            item_representation_list = []
-            for r in range(item_features.shape[0]):
-                row = item_features.getrow(r)
-                # print 'creating %sth item tensor' % r
-                # item and user variables
-                item_weights = self.graph_nodes.get('item_weights')
-                item_representation, item_weights = \
-                    self.item_repr_graph_factory.connect_representation_graph(feature_weights=[item_weights],
-                                                                              tf_features=row.indices,
-                                                                              n_components=self.n_components,
-                                                                              n_features=n_item_features,
-                                                                              node_name_ending='item',
-                                                                              lookup=True)
-                self.graph_nodes['item_weights'] = item_weights[0]
-                item_representation_list.append(tf.reshape(item_representation, shape=(-1,)))
-            self.tf_item_representation = tf.stack(item_representation_list)
-            tf_weights.extend(item_weights)
-            print 'tf_item_representation', self.tf_item_representation
-            print 'item_weights', item_weights[0]
+            item_features = item_features.tocoo()
+            tf_item_feature_indices = tf.stack([tf.constant(item_features.row, dtype=tf.int64),
+                                                tf.constant(item_features.col, dtype=tf.int64)], axis=1)
+            tf_item_features = tf.SparseTensor(tf_item_feature_indices,
+                                               tf.constant(item_features.data,dtype=tf.float32),
+                                               item_features.shape)
+
+        # item and user variables
+        self.tf_item_representation, item_weights = \
+            self.item_repr_graph_factory.connect_representation_graph(feature_weights=[self.graph_nodes.get('item_weights')],
+                                                                      tf_features=tf_item_features,
+                                                                      n_components=self.n_components,
+                                                                      n_features=n_item_features,
+                                                                      node_name_ending='item')
+        tf_weights.extend(item_weights)
+        self.graph_nodes['item_weights'] = item_weights[0]
+
+        print 'tf_item_representation', self.tf_item_representation
+        print 'item_weights', item_weights[0]
 
         user_weights = self.graph_nodes.get('user_weights')
         tf_user_representation_feature, user_weights = self.user_repr_graph_factory.connect_representation_graph(
