@@ -150,6 +150,7 @@ class TensorRec(object):
             tf_features=self.tf_user_feature_cols, n_components=self.n_components, n_features=n_user_features,
             node_name_ending='user', lookup=True)
         tf_weights.extend(user_weights)
+        self.graph_nodes['tf_user_representation_feature'] = tf_user_representation_feature
         self.graph_nodes['user_weights'] = user_weights[0]
         print 'tf_user_representation_feature', tf_user_representation_feature
         print 'user_weights', user_weights[0]
@@ -165,7 +166,7 @@ class TensorRec(object):
             self.graph_nodes['pos_cols'] = pos_cols
             self.graph_nodes['user_cols'] = user_cols
         with tf.name_scope('pos_example'):
-            pos_item_representation = tf.reshape(tf.gather(self.tf_item_representation, pos_cols, name='get_positive_item'), shape=(1,-1))
+            pos_item_representation = tf.reshape(tf.nn.embedding_lookup(self.tf_item_representation, pos_cols, name='get_positive_item'), shape=(1,-1))
             print 'pos_item_representation', pos_item_representation
 
         # user representation
@@ -205,10 +206,24 @@ class TensorRec(object):
         with tf.name_scope('reg_loss'):
             self.tf_weight_reg_loss = sum(tf.nn.l2_loss(weights) for weights in tf_weights)
         with tf.name_scope('loss'):
-            self.tf_loss = self.tf_basic_loss + (self.tf_alpha * self.tf_weight_reg_loss)
+            # self.tf_loss = self.tf_basic_loss + (self.tf_alpha * self.tf_weight_reg_loss)
+            self.tf_loss = self.tf_basic_loss # do norm truncating each epoch like Starspace
         with tf.name_scope('optimizer'):
             self.tf_optimizer = tf.train.AdamOptimizer(learning_rate=self.tf_learning_rate).minimize(self.tf_loss)
-        # Record the new node names
+
+        def trunc_norm(var, name_ending='var'):
+            with tf.name_scope('truc_'+name_ending):
+                norm = tf.norm(var, axis=1)
+                norm_truc = tf.maximum(norm, 1)
+                tf.assign(var, var/tf.reshape(norm_truc, shape=(-1,1)))
+                return tf.reduce_sum(var)
+
+        # do truncate norm like Starspace
+        self.graph_nodes['truncat'] = tf.add(trunc_norm(self.graph_nodes['item_weights'], 'item_weights'),
+                                        trunc_norm(self.graph_nodes['user_weights'], 'item_weights'),
+                                             name='truncate_weights')
+
+
 
     def fit(self, interactions, user_features, item_features, epochs=100, learning_rate=0.1, alpha=0.00001,
             verbose=False, margin=0.2):
@@ -305,6 +320,15 @@ class TensorRec(object):
             # Numbers of features are either learned at fit time from the shape of these two matrices or specified at
             # TensorRec construction and cannot be changed.
             self._build_tf_graph(n_user_features=n_user_features, n_item_features=n_item_features, item_features=item_features)
+
+            # ## test only
+            # loss = self.tf_basic_loss
+            # # loss = tf.abs(tf.reduce_sum(self.graph_nodes['tf_user_representation']))
+            # # optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(loss)
+            # optimizer = tf.train.AdamOptimizer().minimize(loss)
+            # ## end test only
+
+
             session.run(tf.global_variables_initializer())
 
         # Build the shared feed dict
@@ -335,6 +359,13 @@ class TensorRec(object):
                 step = epoch*n_users + u
                 feed_dict[self.tf_user_feature_cols] = user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]]
                 feed_dict[self.tf_interaction_cols] = interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]]
+
+
+                # ## test only
+                # _, item_weights, loss_v = session.run([optimizer, self.graph_nodes['item_weights'], loss], feed_dict=feed_dict)
+                # ## end test only
+                #
+
                 if not verbose or step % self.log_interval:
                     session.run(self.tf_optimizer, feed_dict=feed_dict)
                     if step % 100 == 99:
@@ -353,11 +384,11 @@ class TensorRec(object):
 
                     if last_item_weights is not None:
                         interact_words = set(item_features.tocsr()[feed_dict[self.tf_interaction_cols]].indices)
-                        print 'number of updated words, interaction words', np.sum((np.sum(item_weights, axis=1) - np.sum(last_item_weights, axis=1))!=0), len(interact_words)
+                        print out_str + ' number of updated words, interaction words', np.sum((np.sum(item_weights, axis=1) - np.sum(last_item_weights, axis=1))!=0), len(interact_words)
                     last_item_weights = item_weights
-
-
-                    print out_str
+                # do truncate norm like starspace
+            norm_sum = session.run(self.graph_nodes['truncat'])
+            print 'norm_sum after truncate', norm_sum
 
 
 

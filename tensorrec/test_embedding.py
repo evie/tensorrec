@@ -23,12 +23,12 @@ embeddings = tf.Variable(
 embed_list = []
 for i in range(vocabulary_size):
     indices = map(lambda x:x%vocabulary_size, range(i, i+3))
-    new_vec = tf.reduce_sum(tf.nn.embedding_lookup(embeddings, indices), axis=0, name='item_vec')
+    new_vec = tf.reduce_sum(tf.gather(embeddings, indices), axis=0, name='item_vec')
     embed_list.append(new_vec)
 embeddings_items = tf.stack(embed_list, name='all_item_vecs')
 
 # user vector which is the combination of items
-embed = tf.nn.embedding_lookup(embeddings_items, train_inputs, name='user_vec')
+embed = tf.gather(embeddings_items, train_inputs, name='user_vec')
 
 # Construct the variables for the softmax
 weights = tf.Variable(tf.truncated_normal([vocabulary_size, embedding_size],
@@ -40,8 +40,8 @@ hidden_out = tf.matmul(embed, tf.transpose(weights)) + biases
 train_one_hot = tf.one_hot(train_context, vocabulary_size, name='label_one_hot')
 cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=hidden_out, labels=train_one_hot), name='cross_entropy')
 # Construct the SGD optimizer using a learning rate of 1.0.
-# optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(cross_entropy)
-optimizer = tf.train.AdamOptimizer().minimize(cross_entropy)
+optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(cross_entropy)
+# optimizer = tf.train.AdamOptimizer().minimize(cross_entropy)
 
 
 with tf.Session() as sess:

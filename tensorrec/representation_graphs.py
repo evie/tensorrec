@@ -42,10 +42,9 @@ class LinearRepresentationGraph(AbstractRepresentationGraph):
             tf_linear_weights = feature_weights[0]
         with tf.name_scope('repr_{}'.format(node_name_ending)):
             if lookup:
-                tf_repr = tf.reshape(tf.reduce_sum(tf.gather(tf_linear_weights, tf_features),axis=0), shape=(1,-1))
+                tf_repr = tf.reshape(tf.reduce_sum(tf.nn.embedding_lookup(tf_linear_weights, tf_features),axis=0), shape=(1,-1))
             else:
-                tf_repr = tf.stack([tf.gather(tf_linear_weights, i) for i in len(tf_features)])
-                # tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
+                tf_repr = tf.sparse_tensor_dense_matmul(tf_features, tf_linear_weights)
 
         # Return repr layer and variables
         return tf_repr, [tf_linear_weights]
