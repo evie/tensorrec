@@ -7,6 +7,8 @@ import pickle
 from scipy import sparse as sp
 import time
 import tensorflow as tf
+import threading
+import multiprocessing
 
 from .errors import (
     ModelNotBiasedException, ModelNotFitException, ModelWithoutAttentionException, BatchNonSparseInputException,
@@ -105,19 +107,34 @@ class TensorRec(object):
         self.logdir = logdir
         self.graph_nodes = {}
         self.memory_var = None
+        self.active_train_thread = 0
 
-    def _build_tf_graph(self, n_user_features, n_item_features, item_features):
+    def _build_tf_graph(self, n_user_features, n_item_features, item_features, numberOfThreads=1, tf_learning_rate=0.01,
+                        tf_alpha=0.00001, margin=0.2):
 
         # Build placeholders
-        self.tf_learning_rate = tf.placeholder(tf.float32, None, name='learning_rate')
-        self.tf_alpha = tf.placeholder(tf.float32, None, name='alpha')
-        self.margin = tf.placeholder(tf.float32, None, name='margin')
+        self.tf_learning_rate = tf.constant(tf_learning_rate, name='lr_rate') #tf.placeholder(tf.float32, None, name='learning_rate')
+        self.tf_alpha = tf.constant(tf_alpha, name='alpha') #tf.placeholder(tf.float32, None, name='alpha')
+        self.margin = tf.constant(margin, name='margin') #tf.placeholder(tf.float32, None, name='margin')
         # self.negSearchLimit = tf.placeholder(tf.int64, None, name='negSearchLimit')
 
         with tf.name_scope('feed_user_feature'):
             self.tf_user_feature_cols = tf.placeholder(tf.int64, [None], name='tf_user_feature_cols')
         with tf.name_scope('feed_interaction'):
             self.tf_interaction_cols = tf.placeholder(tf.int64, [None], name='tf_interaction_cols')
+
+        # self.graph_nodes['test'] = tf.reduce_sum(self.tf_user_feature_cols) + tf.reduce_sum(self.tf_interaction_cols)
+
+        q = tf.PaddingFIFOQueue(capacity=10000, dtypes=[tf.int64, tf.int64], shapes=[[None], [None]], name='padding_queue')
+        self.queue = q
+        enqueue_op = q.enqueue([self.tf_user_feature_cols, self.tf_interaction_cols], name='enqueue')
+        self.graph_nodes['enqueue'] = enqueue_op
+        # qr = tf.train.QueueRunner(q, [enqueue_op] * numberOfThreads)
+        # self.graph_nodes['qr'] = qr
+        # tf.train.add_queue_runner(qr)
+        input_batch = q.dequeue(name='dequeue')  # It replaces our input placeholder
+        self.graph_nodes['dequeue'] = input_batch
+        self.graph_nodes['q_size'] = q.size(name='q_size')
 
         # Collect the weights for regularization
 
@@ -148,7 +165,7 @@ class TensorRec(object):
         user_weights = self.graph_nodes.get('user_weights')
         tf_user_representation_feature, user_weights = self.user_repr_graph_factory.connect_representation_graph(
             feature_weights=[user_weights],
-            tf_features=self.tf_user_feature_cols, n_components=self.n_components, n_features=n_user_features,
+            tf_features=input_batch[0], n_components=self.n_components, n_features=n_user_features,
             node_name_ending='user', lookup=True)
         tf_weights.extend(user_weights)
         self.graph_nodes['tf_user_representation_feature'] = tf_user_representation_feature
@@ -163,7 +180,7 @@ class TensorRec(object):
                 user_cols = indices[1:]
                 return pos_cols, user_cols
 
-            pos_cols, user_cols = get_positive_item(self.tf_interaction_cols)
+            pos_cols, user_cols = get_positive_item(input_batch[1])
             self.graph_nodes['pos_cols'] = pos_cols
             self.graph_nodes['user_cols'] = user_cols
         with tf.name_scope('pos_example'):
@@ -204,8 +221,8 @@ class TensorRec(object):
         # Build loss graph
         with tf.name_scope('basic_loss'):
             self.tf_basic_loss = self.loss_graph_factory.connect_loss_graph(**loss_graph_kwargs)
-        with tf.name_scope('reg_loss'):
-            self.tf_weight_reg_loss = sum(tf.nn.l2_loss(weights) for weights in tf_weights)
+        # with tf.name_scope('reg_loss'):
+        #     self.tf_weight_reg_loss = sum(tf.nn.l2_loss(weights) for weights in tf_weights)
         with tf.name_scope('loss'):
             # self.tf_loss = self.tf_basic_loss + (self.tf_alpha * self.tf_weight_reg_loss)
             self.tf_loss = self.tf_basic_loss # do norm truncating each epoch like Starspace
@@ -221,7 +238,7 @@ class TensorRec(object):
 
         # do truncate norm like Starspace
         self.graph_nodes['truncat'] = tf.add(trunc_norm(self.graph_nodes['item_weights'], 'item_weights'),
-                                        trunc_norm(self.graph_nodes['user_weights'], 'item_weights'),
+                                        trunc_norm(self.graph_nodes['user_weights'], 'user_weights'),
                                              name='truncate_weights')
 
 
@@ -313,85 +330,100 @@ class TensorRec(object):
         n_items, n_item_features = item_features.shape
         print 'n_users, n_user_features, n_items, n_item_features', n_users, n_user_features, n_items, n_item_features
 
+        user_features = user_features.tocsr()
+        interactions = interactions.tocsr()
+
         # Check if the graph has been constructed by checking the dense prediction node
         # If it hasn't been constructed, initialize it
         if self.memory_var is None:
+            print 'building tensorflow graph'
             self.memory_var = tf.Variable(get_memory() / 1000000000, name='memory', trainable=False)
 
             # Numbers of features are either learned at fit time from the shape of these two matrices or specified at
             # TensorRec construction and cannot be changed.
-            self._build_tf_graph(n_user_features=n_user_features, n_item_features=n_item_features, item_features=item_features)
+            cpu_num = multiprocessing.cpu_count()
+            print 'train thread number %s' % cpu_num
+            self._build_tf_graph(n_user_features=n_user_features, n_item_features=n_item_features, item_features=item_features, numberOfThreads=cpu_num)
+            print 'end building tensorflow graph'
 
-            # ## test only
-            # loss = self.tf_basic_loss
-            # # loss = tf.abs(tf.reduce_sum(self.graph_nodes['tf_user_representation']))
-            # # optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(loss)
-            # optimizer = tf.train.AdamOptimizer().minimize(loss)
-            # ## end test only
-
-
-            session.run(tf.global_variables_initializer())
+            session.run(tf.global_variables_initializer(), )
 
         # Build the shared feed dict
         feed_dict = {self.tf_learning_rate: learning_rate,
                      self.tf_alpha: calculate_batched_alpha(num_batches=n_users, alpha=alpha),
                      self.margin: margin}
 
-        if verbose:
-            logging.info('Beginning fitting')
-
         with tf.name_scope('log_item_weights'):
             variable_summaries(self.graph_nodes['item_weights'])
         with tf.name_scope('log_user_weights'):
             variable_summaries(self.graph_nodes['user_weights'])
         with tf.name_scope('log_training'):
-            tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
+            # tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
             tf.summary.scalar('mean_loss', tf.reduce_mean(self.tf_basic_loss))
             tf.summary.scalar('memory', self.memory_var)
         merged = tf.summary.merge_all()
         train_writer = tf.summary.FileWriter(self.logdir +
-                                        '/train'+time.strftime('%x-%X').replace('/','').replace(':',''), session.graph)
+                                        '/train'+time.strftime('%x-%X').replace('/','').replace(':',''), session.graph,
+                                        max_queue=3, flush_secs=10)
 
-        user_features = user_features.tocsr()
-        interactions = interactions.tocsr()
-        last_item_weights = None
-        for epoch in range(epochs):
+        coord = tf.train.Coordinator()
+        threads = []
+        enqueue_thread = threading.Thread(target=self.run_enqueue, args=(session, coord, epochs, user_features, interactions, verbose))
+        threads.append(enqueue_thread)
+
+        def MyLoop(coord, session, tid):
+            step = 0
+            while not coord.should_stop():
+                step += 1
+                try:
+                    if not verbose or step % self.log_interval or tid != 0:
+                        session.run(self.tf_optimizer)
+                        if step % 100 == 0 and tid==0:
+                            sys.stdout.write('\r step %s ' % (step))
+                    else:
+                        _, _, loss, summary, item_weights = session.run(
+                            [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss,
+                             merged, self.graph_nodes['item_weights']]
+                        )
+                        mean_loss = np.mean(loss)
+                        train_writer.add_summary(summary, step)
+                        out_str = 'step = {} loss = {}'.format( step, mean_loss)
+                        print out_str
+                except Exception as err:
+                    print err
+                    break
+            self.active_train_thread -= 1
+            print 'stop thread %s' % tid
+
+        train_threads = [threading.Thread(target=MyLoop, args=(coord,session,i)) for i in xrange(cpu_num)]
+        threads.extend(train_threads)
+        self.active_train_thread = cpu_num
+        for t in threads:
+            t.start()
+
+        coord.join(threads)
+        print 'end of training'
+        return 0
+
+    def run_enqueue(self, session, coord, epochs, user_features, interactions, verbose=False):
+        cnt = 0
+        for epoch in range(epochs*100):
             for u in xrange(interactions.shape[0]):
-                step = epoch*n_users + u
-                feed_dict[self.tf_user_feature_cols] = user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]]
-                feed_dict[self.tf_interaction_cols] = interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]]
-
-
-                # ## test only
-                # _, item_weights, loss_v = session.run([optimizer, self.graph_nodes['item_weights'], loss], feed_dict=feed_dict)
-                # ## end test only
-                #
-
-                if not verbose or step % self.log_interval:
-                    session.run(self.tf_optimizer, feed_dict=feed_dict)
-                    if step % 100 == 99:
-                        sys.stdout.write('\r training epoch %s, batch %s ' % (epoch, u))
-                else:
-                    _, _, loss, wr_loss, summary, item_weights = session.run(
-                        [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss, self.tf_weight_reg_loss,
-                         merged, self.graph_nodes['item_weights']],
-                        feed_dict=feed_dict
-                    )
-                    mean_loss = np.mean(loss)
-                    weight_reg_l2_loss = alpha * wr_loss
-                    train_writer.add_summary(summary, step)
-                    out_str = 'EPOCH {} user_cnt {} loss = {}, weight_reg_l2_loss = {}'.format(
-                        epoch, u, mean_loss, weight_reg_l2_loss)
-
-                    if last_item_weights is not None:
-                        interact_words = set(item_features.tocsr()[feed_dict[self.tf_interaction_cols]].indices)
-                        print out_str + ' number of updated words, interaction words', np.sum((np.sum(item_weights, axis=1) - np.sum(last_item_weights, axis=1))!=0), len(interact_words)
-                    last_item_weights = item_weights
-                # do truncate norm like starspace
+                uf = np.array(user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]], dtype=np.int64)
+                ir = np.array(interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]], dtype=np.int64)
+                session.run(self.graph_nodes['enqueue'], feed_dict={self.tf_user_feature_cols:uf, self.tf_interaction_cols:ir})
+                cnt += 1
+                if cnt % 1000 == 0:
+                    sys.stdout.write('enqueue %s \n' % cnt)
+                if self.active_train_thread == 0:
+                    print 'end run_enqueue'
+                    return
             norm_sum = session.run(self.graph_nodes['truncat'])
             print 'norm_sum after truncate', norm_sum
-
-
+            if epoch >= epochs:
+                coord.request_stop()
+                # session.run(self.queue.close(name='end_queue'))
+        print 'end run_enqueue 2'
 
     def save_model(self, directory_path):
         """
