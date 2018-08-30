@@ -7,7 +7,7 @@ import pickle
 from scipy import sparse as sp
 import time
 import tensorflow as tf
-import threading
+import threading, thread
 import multiprocessing
 import itertools
 
@@ -108,7 +108,7 @@ class TensorRec(object):
         self.logdir = logdir
         self.graph_nodes = {}
         self.memory_var = None
-        self.active_train_thread = 0
+        self.active_train_thread = None
         self.neg_sample_limit = 100
         self.truncate_interval=1000
         self.coord = None
@@ -122,29 +122,27 @@ class TensorRec(object):
         self.tf_learning_rate = tf.constant(tf_learning_rate, name='lr_rate') #tf.placeholder(tf.float32, None, name='learning_rate')
         self.tf_alpha = tf.constant(tf_alpha, name='alpha') #tf.placeholder(tf.float32, None, name='alpha')
         self.margin = tf.constant(margin, name='margin') #tf.placeholder(tf.float32, None, name='margin')
-        # self.negSearchLimit = tf.placeholder(tf.int64, None, name='negSearchLimit')
+        # self.negSearchLimit = tf.placeholder(tf.int32, None, name='negSearchLimit')
 
         with tf.name_scope('feed_user_feature'):
-            self.tf_user_feature_cols = tf.placeholder(tf.int64, [None], name='tf_user_feature_cols')
+            self.tf_user_feature_cols = tf.placeholder(tf.int32, [None], name='tf_user_feature_cols')
         with tf.name_scope('feed_interaction'):
-            self.tf_interaction_words_user = tf.placeholder(tf.int64, [None], name='tf_interaction_words_user')
-            self.tf_interaction_words_pos = tf.placeholder(tf.int64, [None], name='tf_interaction_words_pos')
+            self.tf_interaction_words_user = tf.placeholder(tf.int32, [None], name='tf_interaction_words_user')
+            self.tf_interaction_words_pos = tf.placeholder(tf.int32, [None], name='tf_interaction_words_pos')
         with tf.name_scope('neg_example'):
-            self.tf_interaction_words_neg = tf.placeholder(tf.int64, [None], name='tf_interaction_words_neg')
-            self.tf_interaction_words_neg_len = tf.placeholder(tf.int64, [None], name='tf_interaction_words_neg_len')
+            self.tf_interaction_words_neg = tf.placeholder(tf.int32, [None], name='tf_interaction_words_neg')
+            self.tf_interaction_words_neg_len = tf.placeholder(tf.int32, [None], name='tf_interaction_words_neg_len')
 
         # self.graph_nodes['test'] = tf.reduce_sum(self.tf_user_feature_cols) + tf.reduce_sum(self.tf_interaction_cols)
 
-        q = tf.PaddingFIFOQueue(capacity=10000, dtypes=[tf.int64, tf.int64, tf.int64, tf.int64, tf.int64],
+        q = tf.PaddingFIFOQueue(capacity=5000, dtypes=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32],
                                 shapes=[[None], [None], [None], [None], [self.neg_sample_limit]], name='padding_queue')
         self.queue = q
         enqueue_op = q.enqueue([self.tf_user_feature_cols, self.tf_interaction_words_user,
                                 self.tf_interaction_words_pos, self.tf_interaction_words_neg,
                                 self.tf_interaction_words_neg_len], name='enqueue')
         self.graph_nodes['enqueue'] = enqueue_op
-        # qr = tf.train.QueueRunner(q, [enqueue_op] * numberOfThreads)
-        # self.graph_nodes['qr'] = qr
-        # tf.train.add_queue_runner(qr)
+
         input_batch = q.dequeue(name='dequeue')  # It replaces our input placeholder
         user_features, words_user, words_pos, words_neg, words_neg_len = input_batch
         self.graph_nodes['dequeue'] = input_batch
@@ -327,6 +325,7 @@ class TensorRec(object):
 
         session = get_session()
         self.neg_sample_limit = negSearchLimit
+        self.epochs = epochs
 
         if verbose:
             logging.info('Processing interaction and feature data')
@@ -335,6 +334,7 @@ class TensorRec(object):
         n_users, n_user_features = user_features.shape
         n_items, n_item_features = item_features.shape
         print 'n_users, n_user_features, n_items, n_item_features', n_users, n_user_features, n_items, n_item_features
+        self.n_users = n_users
 
         user_features = user_features.tocsr()
         interactions = interactions.tocsr()
@@ -373,26 +373,33 @@ class TensorRec(object):
             tf.summary.scalar('memory', self.memory_var)
             tf.summary.scalar('valid_neg_num', self.graph_nodes['valid_neg_num'])
             tf.summary.scalar('reg_vars_cnt', self.graph_nodes['reg_vars_cnt'])
+            tf.summary.scalar('queue_size', self.graph_nodes['q_size'])
+
         merged = tf.summary.merge_all()
-        train_writer = tf.summary.FileWriter(self.logdir +
-                                        '/train'+time.strftime('%x-%X').replace('/','').replace(':',''), session.graph,
-                                        max_queue=3, flush_secs=10)
+        train_writer = tf.summary.FileWriter(self.logdir +'/'+time.strftime('%x-%X').replace('/','').replace(':',''),
+                                        session.graph,
+                                        max_queue=10, flush_secs=30)
 
         coord = tf.train.Coordinator()
         self.coord = coord
         threads = []
-        enqueue_thread = threading.Thread(target=self.run_enqueue, args=(session, coord, epochs, user_features,
-                                                                        interactions, item_dict, negSearchLimit, verbose))
-        threads.append(enqueue_thread)
+        with tf.name_scope('dataset'):
+            dataset = (tf.data.Dataset.from_generator(self.dataset_gen, output_types=tf.int32, output_shapes=tf.TensorShape([]))
+                        .map(lambda u: self.run_enqueue(u, session, user_features, interactions, item_dict, neg_sample_limit=100),num_parallel_calls=3))
+            itr = dataset.make_initializable_iterator()
+            session.run(itr.initializer)
+            enqueue_op_func = itr.get_next()
 
-        def MyLoop(coord, session, tid):
+            qr = tf.train.QueueRunner(self.queue, [enqueue_op_func] * 5)
+            tf.train.add_queue_runner(qr)
+            tf.train.start_queue_runners(session, coord=None)
+
+        def train_worker(coord, session, tid):
             step = 0
             while not coord.should_stop():
                 step += 1
                 if not verbose or step % self.log_interval or tid != 0:
                     session.run(self.tf_optimizer)
-                    if step % 100 == 0 and tid==0:
-                        sys.stdout.write('\r step %s ' % (step))
                 else:
                     _, _, loss, summary = session.run(
                         [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss,
@@ -406,7 +413,7 @@ class TensorRec(object):
             self.active_train_thread -= 1
             print '*** stop thread %s ***' % tid
 
-        train_threads = [threading.Thread(target=MyLoop, args=(coord,session,i)) for i in xrange(cpu_num)]
+        train_threads = [threading.Thread(target=train_worker, args=(coord,session,i)) for i in xrange(cpu_num)]
         threads.extend(train_threads)
         self.active_train_thread = cpu_num
         for t in threads:
@@ -416,31 +423,14 @@ class TensorRec(object):
         print 'end of training'
         return 0
 
-    def run_enqueue(self, session, coord, epochs, user_features, interactions, item_dict, neg_sample_limit=100, verbose=False):
+    def dataset_gen(self):
         cnt = 0
-        item_num = len(item_dict)
-        print 'start runing enqueue'
-        for epoch in range(epochs*100000):
-            for u in xrange(interactions.shape[0]):
-                uf = np.array(user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]], dtype=np.int64)
-                ir = np.array(interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]], dtype=np.int64)
-                if len(ir)<2:
-                    continue
-                np.random.shuffle(ir)
-                words_user = [x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[1:]])]
-                words_pos = [x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[:1]])]
-                neg_items = filter(lambda l:len(l) > 0, [item_dict.get(x, []) for x in np.random.randint(item_num, size=neg_sample_limit*2) if x not in ir])[:neg_sample_limit]
-                if len(neg_items) != neg_sample_limit:
-                    print "neg_item is not enough %s" % len(neg_items)
-                    continue
-                words_neg = [x for x in itertools.chain.from_iterable(neg_items)]
-                words_neg_len = [len(l) for l in neg_items]
-
-                session.run(self.graph_nodes['enqueue'], feed_dict={self.tf_user_feature_cols:uf,
-                                                                    self.tf_interaction_words_user:words_user,
-                                                                    self.tf_interaction_words_pos:words_pos,
-                                                                    self.tf_interaction_words_neg:words_neg,
-                                                                    self.tf_interaction_words_neg_len: words_neg_len})
+        session = get_session()
+        print 'start running dataset_gen, tid=%s' % thread.get_ident()
+        for epoch in range(self.epochs*100000):
+            users = range(self.n_users)
+            np.random.shuffle(users)
+            for u in users:
                 cnt += 1
                 if cnt % self.input_step_size == 0:
                     queue_size = session.run(self.graph_nodes['q_size'])
@@ -448,13 +438,40 @@ class TensorRec(object):
                 if cnt % self.truncate_interval == 0:
                     norm_sum, item_weights = session.run([self.graph_nodes['truncat'], self.graph_nodes['item_weights']])
                     print 'after truncatem norm_sum %s, min %s, max %s' % (norm_sum, np.min(item_weights), np.max(item_weights))
-                if self.active_train_thread == 0:
-                    print 'end run_enqueue'
+                if self.active_train_thread is not None and self.active_train_thread == 0:
+                    print 'end dataset_gen'
                     return
-            if epoch >= epochs:
-                coord.request_stop()
-                # session.run(self.queue.close(name='end_queue'))
-        print 'end run_enqueue 2'
+                if epoch >= self.epochs:
+                    self.coord.request_stop()
+                yield u
+        print 'end dataset_gen 2'
+
+    def run_enqueue(self, u, session, user_features, interactions, item_dict, neg_sample_limit=100):
+        item_num = len(item_dict)
+        print 'start runing enqueue'
+
+        def get_input(u):
+            uf = np.array(user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]], dtype=np.int32)
+            ir = np.array(interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]], dtype=np.int32)
+            if len(ir)<2:
+                print 'interaction is not enough'
+                return None
+            pos_idx = np.random.randint(len(ir))
+            words_user = np.array([x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[pos_idx+1:].tolist()+ir[:pos_idx].tolist()])],np.int32)
+            words_pos = np.array([x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[pos_idx:pos_idx+1]])], np.int32)
+            neg_items = filter(lambda l:len(l) > 0, [item_dict.get(x, []) for x in np.random.randint(item_num, size=neg_sample_limit*2) if x not in ir])[:neg_sample_limit]
+            if len(neg_items) != neg_sample_limit:
+                print "neg_item is not enough %s" % len(neg_items)
+                return None
+            words_neg = np.array([x for x in itertools.chain.from_iterable(neg_items)],np.int32)
+            words_neg_len = np.array([len(l) for l in neg_items],np.int32)
+            return uf, words_user, words_pos, words_neg, words_neg_len
+
+        (uf, words_user, words_pos, words_neg, words_neg_len) = \
+                tf.py_func(get_input, inp=[u], Tout=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32],stateful=True, name='transform')
+
+        self.queue.enqueue([uf, words_user, words_pos, words_neg, words_neg_len])
+        return u
 
     def save_model(self, directory_path):
         """

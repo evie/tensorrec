@@ -12,6 +12,7 @@ def get_session():
             _session = tf.get_default_session()
         else:
             _session = tf.Session()
+            _session.as_default()
 
     return _session
 
@@ -19,3 +20,4 @@ def get_session():
 def set_session(session):
     global _session
     _session = session
+    _session.as_default()

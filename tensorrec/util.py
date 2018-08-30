@@ -189,7 +189,7 @@ class lazyval(object):
         del self._cache[instance]
 
 
-def variable_summaries(var, cosine=None, N=1000):
+def variable_summaries(var, cosine=None, N=100):
     """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
     with tf.name_scope('vars_summaries'):
         mean = tf.reduce_mean(var)
@@ -199,17 +199,18 @@ def variable_summaries(var, cosine=None, N=1000):
         tf.summary.scalar('stddev', stddev)
         tf.summary.scalar('max', tf.reduce_max(var))
         tf.summary.scalar('min', tf.reduce_min(var))
-        tf.summary.histogram('values_histogram', var/tf.reshape(tf.norm(var, axis=1),shape=(-1, 1)))
+        tf.summary.histogram('values_histogram', var/tf.reshape(tf.norm(var, axis=1), shape=(-1, 1)))
         if cosine:
-            n = tf.shape(var)[0]
-            idx1 = tf.random_uniform(shape=(N,),maxval=n, dtype=tf.int32)
-            idx2 = tf.random_uniform(shape=(N,),maxval=n, dtype=tf.int32)
+            # n = tf.shape(var)[0]
+            # idx1 = tf.random_uniform(shape=(N,),maxval=n, dtype=tf.int32)
+            # idx2 = tf.random_uniform(shape=(N,),maxval=n, dtype=tf.int32)
+            idx1 = tf.range(0,100,dtype=tf.int64)
+            idx2 = idx1
             v1 = tf.nn.embedding_lookup(var,idx1)
             v2 = tf.nn.embedding_lookup(var,idx2)
             ret = cosine(v1,v2)
             tf.summary.histogram('similarity', ret)
-
-
+            tf.summary.image('similarity', tf.reshape(ret, shape=(1,tf.shape(ret)[0], tf.shape(ret)[1], 1)))
 
 
 def get_memory():
