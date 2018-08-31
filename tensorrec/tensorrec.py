@@ -1,10 +1,7 @@
-from functools import partial
-from itertools import cycle
 import logging
 import numpy as np
 import os,sys
 import pickle
-from scipy import sparse as sp
 import time
 import tensorflow as tf
 import threading, thread
@@ -12,20 +9,14 @@ import multiprocessing
 import itertools
 
 from .errors import (
-    ModelNotBiasedException, ModelNotFitException, ModelWithoutAttentionException, BatchNonSparseInputException,
     TfVersionException
 )
 from .input_utils import create_tensorrec_iterator, get_dimensions_from_tensorrec_dataset
 from .loss_graphs import AbstractLossGraph, WMRBLossGraph
 from .prediction_graphs import AbstractPredictionGraph, CosineSimilarityPredictionGraph
-from .recommendation_graphs import (
-    project_biases, split_sparse_tensor_indices, bias_prediction_dense, bias_prediction_serial, rank_predictions,
-    densify_sampled_item_predictions, collapse_mixture_of_tastes, predict_similar_items
-)
 from .representation_graphs import AbstractRepresentationGraph, LinearRepresentationGraph
 from .session_management import get_session
-from .util import (sample_items, calculate_batched_alpha, datasets_from_raw_input, sample_items_stratified,
-                   variable_summaries, get_memory)
+from .util import (variable_summaries, get_memory, multiple_workers, multiple_workers_thread, stop_subprocess, get_queue_size)
 
 
 class TensorRec(object):
@@ -113,11 +104,16 @@ class TensorRec(object):
         self.truncate_interval=1000
         self.coord = None
         self.input_step_size = 1000
+        self.sub_process = []
+        self.queue_input = None
+        self.queue_output = None
+        self.queue_input_cap = 100
+        self.queue_output_cap = 100
+        self.gen_ex_n_worker = 1
+        self.tf_enqueue_n_worker = 1
+        self.tf_queue_cap = 1000
 
-
-    def _build_tf_graph(self, n_user_features, n_item_features, item_features, numberOfThreads=1, tf_learning_rate=0.01,
-                        tf_alpha=0.00001, margin=0.2):
-
+    def _build_tf_graph(self, n_user_features, n_item_features, tf_learning_rate=0.01, tf_alpha=0.00001, margin=0.2, use_reg=False):
         # Build placeholders
         self.tf_learning_rate = tf.constant(tf_learning_rate, name='lr_rate') #tf.placeholder(tf.float32, None, name='learning_rate')
         self.tf_alpha = tf.constant(tf_alpha, name='alpha') #tf.placeholder(tf.float32, None, name='alpha')
@@ -135,7 +131,7 @@ class TensorRec(object):
 
         # self.graph_nodes['test'] = tf.reduce_sum(self.tf_user_feature_cols) + tf.reduce_sum(self.tf_interaction_cols)
 
-        q = tf.PaddingFIFOQueue(capacity=5000, dtypes=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32],
+        q = tf.PaddingFIFOQueue(capacity=self.tf_queue_cap, dtypes=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32],
                                 shapes=[[None], [None], [None], [None], [self.neg_sample_limit]], name='padding_queue')
         self.queue = q
         enqueue_op = q.enqueue([self.tf_user_feature_cols, self.tf_interaction_words_user,
@@ -149,8 +145,6 @@ class TensorRec(object):
         self.graph_nodes['q_size'] = q.size(name='q_size')
 
         # Collect the vars for computing regulation
-        reg_vars = []
-        reg_vars_cnt = 0
         # item feature variable
         _, item_weights = \
             self.item_repr_graph_factory.connect_representation_graph(feature_weights=[self.graph_nodes.get('item_weights')],
@@ -201,6 +195,9 @@ class TensorRec(object):
             print 'neg_items_representation', neg_items_representation
             self.graph_nodes['neg_item_representation'] = neg_items_representation
 
+        with tf.name_scope('words_cnt'):
+            self.graph_nodes['words_cnt'] = tf.shape(words_user)[0] + tf.shape(words_pos)[0] + tf.shape(words_neg)[0]
+
         # Compose loss function args
         # This composition is for execution safety: it prevents loss functions that are incorrectly configured from
         # having visibility of certain nodes.
@@ -219,15 +216,14 @@ class TensorRec(object):
         with tf.name_scope('reg_loss'):
             # reg_vars = [self.tf_user_representation, neg_items_representation, pos_item_representation]
             reg_vars = [self.graph_nodes['item_weights'], self.graph_nodes['user_weights']]
-            self.graph_nodes['reg_vars_cnt'] = tf.shape(words_user)[0] + tf.shape(words_pos)[0] + tf.shape(words_neg)[0]
-            # reg_vars_cnt = tf.shape(words_user)[0] + tf.shape(words_pos)[0] + tf.shape(words_neg)[0]
-            reg_vars_cnt = 1
-
-            self.tf_weight_reg_loss = self.tf_alpha * sum(tf.nn.l2_loss(weights) for weights in reg_vars) / tf.cast(reg_vars_cnt, tf.float32)
+            self.tf_weight_reg_loss = self.tf_alpha * sum(tf.nn.l2_loss(weights) for weights in reg_vars)
             self.graph_nodes['tf_weight_reg_loss'] = self.tf_weight_reg_loss
         with tf.name_scope('loss'):
-            # self.tf_loss = self.tf_basic_loss + self.tf_weight_reg_loss
-            self.tf_loss = self.tf_basic_loss # do norm truncating each epoch like Starspace
+            if use_reg:
+                print "using l2_reg of weights for part of loss"
+                self.tf_loss = self.tf_basic_loss + self.tf_weight_reg_loss
+            else:
+                self.tf_loss = self.tf_basic_loss
         with tf.name_scope('optimizer'):
             self.tf_optimizer = tf.train.AdamOptimizer(learning_rate=self.tf_learning_rate).minimize(self.tf_loss)
 
@@ -244,10 +240,8 @@ class TensorRec(object):
                                                 trunc_norm(self.graph_nodes['user_weights'], 'user_weights'),
                                                 name='truncate_weights')
 
-
-
     def fit(self, interactions, user_features, item_features, epochs=100, learning_rate=0.1, alpha=0.00001,
-            verbose=False, margin=0.2, negSearchLimit=100, train_threads=None):
+            verbose=False, margin=0.2, negSearchLimit=100, train_threads=None, use_reg=False):
         """
         Constructs the TensorRec graph and fits the model.
         :param interactions: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
@@ -279,50 +273,7 @@ class TensorRec(object):
         The number of items to sample per user for use in loss functions. Must be non-None if
         self.loss_graph_factory.is_sample_based is True.
         """
-
-        # Pass-through to fit_partial
-        self.fit_partial(interactions=interactions,
-                         user_features=user_features,
-                         item_features=item_features,
-                         epochs=epochs,
-                         learning_rate=learning_rate,
-                         alpha=alpha,
-                         verbose=verbose, margin=margin, negSearchLimit=negSearchLimit, train_threads=train_threads)
-
-    def fit_partial(self, interactions, user_features, item_features, epochs=1, learning_rate=0.1,
-                    alpha=0.00001, verbose=False, margin=0.2, negSearchLimit=100, train_threads=None):
-        """
-        Constructs the TensorRec graph and fits the model.
-        :param interactions: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
-        A matrix of interactions of shape [n_users, n_items].
-        If a Dataset, the Dataset must follow the format used in tensorrec.input_utils.
-        If a str, the string must be the path to a TFRecord file.
-        If a list, the list must contain scipy.sparse matrices, tensorflow.data.Datasets, or strs.
-        :param user_features: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
-        A matrix of user features of shape [n_users, n_user_features].
-        If a Dataset, the Dataset must follow the format used in tensorrec.input_utils.
-        If a str, the string must be the path to a TFRecord file.
-        If a list, the list must contain scipy.sparse matrices, tensorflow.data.Datasets, or strs.
-        :param item_features: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
-        A matrix of item features of shape [n_items, n_item_features].
-        If a Dataset, the Dataset must follow the format used in tensorrec.input_utils.
-        If a str, the string must be the path to a TFRecord file.
-        If a list, the list must contain scipy.sparse matrices, tensorflow.data.Datasets, or strs.
-        :param epochs: Integer
-        The number of epochs to fit the model.
-        :param learning_rate: Float
-        The learning rate of the model.
-        :param alpha:
-        The weight regularization loss coefficient.
-        :param verbose: boolean
-        If true, the model will print a number of status statements during fitting.
-        :param user_batch_size: int or None
-        The maximum number of users per batch, or None for all users.
-        :param n_sampled_items: int or None
-        The number of items to sample per user for use in loss functions. Must be non-None if
-        self.loss_graph_factory.is_sample_based is True.
-        """
-
+        start_time = time.time()
         session = get_session()
         self.neg_sample_limit = negSearchLimit
         self.epochs = epochs
@@ -339,7 +290,8 @@ class TensorRec(object):
         user_features = user_features.tocsr()
         interactions = interactions.tocsr()
         item_features = item_features.tocsr()
-        item_dict = {i:item_features.getrow(i).indices for i in range(item_features.shape[0])}
+        item_dict = {i: item_features.indices[item_features.indptr[i]:item_features.indptr[i + 1]] for i in
+                     range(item_features.shape[0])}
 
         # Check if the graph has been constructed by checking the dense prediction node
         # If it hasn't been constructed, initialize it
@@ -349,31 +301,34 @@ class TensorRec(object):
 
             # Numbers of features are either learned at fit time from the shape of these two matrices or specified at
             # TensorRec construction and cannot be changed.
-            cpu_num = train_threads if train_threads else multiprocessing.cpu_count()-1
-            print 'train thread number %s' % cpu_num
-            self._build_tf_graph(n_user_features=n_user_features, n_item_features=n_item_features, item_features=item_features, numberOfThreads=cpu_num)
+            self._build_tf_graph(n_user_features=n_user_features, n_item_features=n_item_features, use_reg=use_reg,
+                                 margin=margin, tf_learning_rate=learning_rate, tf_alpha=alpha)
             print 'end building tensorflow graph'
+
+            queue_input_size = tf.py_func(lambda : get_queue_size(self.queue_input), inp=[], Tout=tf.int64)
+            queue_output_size = tf.py_func(lambda : get_queue_size(self.queue_output), inp=[], Tout=tf.int64)
 
             session.run(tf.global_variables_initializer(), )
 
         # Build the shared feed dict
-        feed_dict = {self.tf_learning_rate: learning_rate,
-                     self.tf_alpha: calculate_batched_alpha(num_batches=n_users, alpha=alpha),
-                     self.margin: margin}
+        # feed_dict = {self.tf_learning_rate: learning_rate,
+        #              self.tf_alpha: calculate_batched_alpha(num_batches=n_users, alpha=alpha),
+        #              self.margin: margin}
 
         with tf.name_scope('log_item_weights'):
             variable_summaries(self.graph_nodes['item_weights'], self.prediction_graph_factory.connect_dense_prediction_graph)
         with tf.name_scope('log_user_weights'):
             variable_summaries(self.graph_nodes['user_weights'])
         with tf.name_scope('log_training'):
-            # tf.summary.scalar('weight_reg_l2_loss', alpha * self.tf_weight_reg_loss)
             tf.summary.scalar('basic_loss', tf.reduce_mean(self.tf_basic_loss))
             tf.summary.scalar('tf_weight_reg_loss', self.graph_nodes['tf_weight_reg_loss'])
             tf.summary.scalar('loss', self.tf_loss)
             tf.summary.scalar('memory', self.memory_var)
             tf.summary.scalar('valid_neg_num', self.graph_nodes['valid_neg_num'])
-            tf.summary.scalar('reg_vars_cnt', self.graph_nodes['reg_vars_cnt'])
-            tf.summary.scalar('queue_size', self.graph_nodes['q_size'])
+            tf.summary.scalar('words_cnt', self.graph_nodes['words_cnt'])
+            tf.summary.scalar('tf_queue_size', self.graph_nodes['q_size'])
+            tf.summary.scalar('preprocess_input_queue_size', queue_input_size)
+            tf.summary.scalar('preprocess_output_queue_size', queue_output_size)
 
         merged = tf.summary.merge_all()
         train_writer = tf.summary.FileWriter(self.logdir +'/'+time.strftime('%x-%X').replace('/','').replace(':',''),
@@ -383,50 +338,60 @@ class TensorRec(object):
         coord = tf.train.Coordinator()
         self.coord = coord
         threads = []
-        with tf.name_scope('dataset'):
-            dataset = (tf.data.Dataset.from_generator(self.dataset_gen, output_types=tf.int32, output_shapes=tf.TensorShape([]))
-                        .map(lambda u: self.run_enqueue(u, session, user_features, interactions, item_dict, neg_sample_limit=100),num_parallel_calls=3))
-            itr = dataset.make_initializable_iterator()
-            session.run(itr.initializer)
-            enqueue_op_func = itr.get_next()
+        self.queue_input, self.queue_output, self.sub_process = multiple_workers_thread(
+            lambda tid, q_in, q_out: self.get_train_example(tid, q_in, q_out,
+                                                user_features, interactions, item_dict, neg_sample_limit=100),
+            queue_capacity_input=self.queue_input_cap, queue_capacity_output=self.queue_output_cap, n_worker=self.gen_ex_n_worker)
 
-            qr = tf.train.QueueRunner(self.queue, [enqueue_op_func] * 5)
-            tf.train.add_queue_runner(qr)
-            tf.train.start_queue_runners(session, coord=None)
+        gen_thread = threading.Thread(target=self.gen_user_id, args=(self.queue_input,), name='generate_user_id_thread')
+        enqueue_threads = [threading.Thread(target=self.enqueue_func, args=(self.queue_output,), name='enqueue tensorflow') for i in range(3)]
+        # self.active_train_thread += 1
+        for t in enqueue_threads: t.start()
+        gen_thread.start()
 
         def train_worker(coord, session, tid):
             step = 0
+            print '*** start running train_worker %s' % tid
             while not coord.should_stop():
                 step += 1
                 if not verbose or step % self.log_interval or tid != 0:
                     session.run(self.tf_optimizer)
                 else:
-                    _, _, loss, summary = session.run(
-                        [self.memory_var.assign(get_memory() / 1000000000), self.tf_optimizer, self.tf_basic_loss,
-                         merged]
+                    _, _, loss, summary,q_size = session.run(
+                        [self.memory_var.assign(get_memory() / 10**9), self.tf_optimizer, self.tf_basic_loss,
+                         merged, self.graph_nodes['q_size']]
                     )
                     mean_loss = np.mean(loss)
                     train_writer.add_summary(summary, step)
-                    out_str = 'train: step = {} loss = {}'.format( step, mean_loss)
+                    out_str = '\ttrain: step = {} loss = {}, q_size = {}'.format( step, mean_loss, q_size)
                     print out_str
 
             self.active_train_thread -= 1
-            print '*** stop thread %s ***' % tid
+            print '--- stop train_worker thread %s ---' % tid
 
+        cpu_num = train_threads if train_threads else multiprocessing.cpu_count() - 1
+        print 'train thread number %s' % cpu_num
         train_threads = [threading.Thread(target=train_worker, args=(coord,session,i)) for i in xrange(cpu_num)]
         threads.extend(train_threads)
-        self.active_train_thread = cpu_num
+        self.active_train_thread = cpu_num  # training threads
         for t in threads:
             t.start()
 
-        coord.join(threads)
-        print 'end of training'
+        for t in threads:
+            t.join()
+        gen_thread.join()
+        for t in enqueue_threads: t.join()
+        stop_subprocess(self.sub_process)
+        for p in self.sub_process:
+            p.join()
+        print '\n--- end of training---'
+        print 'used time %s' % (time.time() - start_time)
         return 0
 
-    def dataset_gen(self):
+    def gen_user_id(self, queue_input):
+        print '* start running gen_user_id, tid=%s' % thread.get_ident()
         cnt = 0
         session = get_session()
-        print 'start running dataset_gen, tid=%s' % thread.get_ident()
         for epoch in range(self.epochs*100000):
             users = range(self.n_users)
             np.random.shuffle(users)
@@ -434,44 +399,80 @@ class TensorRec(object):
                 cnt += 1
                 if cnt % self.input_step_size == 0:
                     queue_size = session.run(self.graph_nodes['q_size'])
-                    sys.stdout.write('enqueue: epoch %3s, cnt %8s, queue_size %3s \n' % (epoch, cnt, queue_size))
+                    sys.stdout.write('\tgen_user_id: epoch %3s, cnt %8s, queue_size %3s \n' % (epoch, cnt, queue_size))
                 if cnt % self.truncate_interval == 0:
                     norm_sum, item_weights = session.run([self.graph_nodes['truncat'], self.graph_nodes['item_weights']])
-                    print 'after truncatem norm_sum %s, min %s, max %s' % (norm_sum, np.min(item_weights), np.max(item_weights))
+                    print '\tafter truncatem norm_sum %s, min %s, max %s' % (norm_sum, np.min(item_weights), np.max(item_weights))
                 if self.active_train_thread is not None and self.active_train_thread == 0:
-                    print 'end dataset_gen'
+                    print '- end gen_user_id'
                     return
                 if epoch >= self.epochs:
                     self.coord.request_stop()
-                yield u
-        print 'end dataset_gen 2'
+                    u = -1  # subprocess will stop for u < 0
+                # print 'gen uid %s' % u
+                try:
+                    queue_input.put(u, timeout=10)
+                except Exception:
+                    print 'enqueue uid timeout'
 
-    def run_enqueue(self, u, session, user_features, interactions, item_dict, neg_sample_limit=100):
+        print '- end gen_user_id 2'
+
+    def enqueue_func(self, queue_output):
+        print '* start enqueue_func: feed tensorflow queue'
+        session = get_session()
+        cnt = 0
+        while self.active_train_thread != 0:  # if this is not the only thread running
+            try:
+                ex = queue_output.get(timeout=5)
+                cnt += 1
+                if cnt % 1000 == 0:
+                    print '\tenqueue_func %s, waiting %s' % (cnt, get_queue_size(queue_output))
+                # Set a 5-second timeout.
+                run_options = tf.RunOptions(timeout_in_ms=5000)
+                session.run(self.graph_nodes['enqueue'], options= run_options,
+                            feed_dict={self.tf_user_feature_cols: ex[0],
+                                        self.tf_interaction_words_user: ex[1],
+                                        self.tf_interaction_words_pos: ex[2],
+                                        self.tf_interaction_words_neg: ex[3],
+                                        self.tf_interaction_words_neg_len: ex[4]})
+            except Exception as err:
+                print 'exception enqueue_func', err
+        print '- end enqueue_func'
+
+    def get_train_example(self, tid, queue_input, queue_output, user_features, interactions, item_dict, neg_sample_limit=100):
         item_num = len(item_dict)
-        print 'start runing enqueue'
+        print '* start running get_train_example', tid
 
         def get_input(u):
-            uf = np.array(user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]], dtype=np.int32)
-            ir = np.array(interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]], dtype=np.int32)
+            uf = user_features.indices[user_features.indptr[u]:user_features.indptr[u+1]]
+            ir = interactions.indices[interactions.indptr[u]:interactions.indptr[u+1]]
             if len(ir)<2:
                 print 'interaction is not enough'
                 return None
             pos_idx = np.random.randint(len(ir))
-            words_user = np.array([x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[pos_idx+1:].tolist()+ir[:pos_idx].tolist()])],np.int32)
-            words_pos = np.array([x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[pos_idx:pos_idx+1]])], np.int32)
-            neg_items = filter(lambda l:len(l) > 0, [item_dict.get(x, []) for x in np.random.randint(item_num, size=neg_sample_limit*2) if x not in ir])[:neg_sample_limit]
-            if len(neg_items) != neg_sample_limit:
-                print "neg_item is not enough %s" % len(neg_items)
+            words_user = [x for x in itertools.chain.from_iterable([item_dict.get(item, []) for item in ir[pos_idx+1:].tolist()+ir[:pos_idx].tolist()])]
+            words_pos = item_dict.get(ir[pos_idx], [])
+            neg_items = filter(lambda l:len(l) > 0, [item_dict.get(x, []) for x in np.random.randint(item_num, size=neg_sample_limit+5)])[:neg_sample_limit]
+            if len(neg_items) != neg_sample_limit or len(words_user) == 0 or len(words_pos)==0 or len(uf) == 0:
+                # print "\t\tneg_item/words_user/words_pos has not enough words (%s,%s,%s,pos_idx=%s)" % (len(neg_items),len(words_user), len(words_pos), pos_idx)
                 return None
-            words_neg = np.array([x for x in itertools.chain.from_iterable(neg_items)],np.int32)
-            words_neg_len = np.array([len(l) for l in neg_items],np.int32)
+            words_neg = [x for x in itertools.chain.from_iterable(neg_items)]
+            words_neg_len = [len(l) for l in neg_items]
             return uf, words_user, words_pos, words_neg, words_neg_len
 
-        (uf, words_user, words_pos, words_neg, words_neg_len) = \
-                tf.py_func(get_input, inp=[u], Tout=[tf.int32, tf.int32, tf.int32, tf.int32, tf.int32],stateful=True, name='transform')
-
-        self.queue.enqueue([uf, words_user, words_pos, words_neg, words_neg_len])
-        return u
+        while self.active_train_thread != 0:
+            try:
+                u = queue_input.get(timeout=5)
+                if u<0:
+                    break
+                # print 'tid %s, u %s' %(tid, u)
+                r = get_input(u)
+                if r:
+                    # print 'tid %s, put example u %s' % (tid, u)
+                    queue_output.put(r,timeout=5)
+            except Exception as err:
+                print 'get_train_example exception', err
+        print '- end get_train_input'
 
     def save_model(self, directory_path):
         """

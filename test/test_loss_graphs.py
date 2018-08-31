@@ -32,8 +32,8 @@ class LossGraphsTestCase(TestCase):
         print cls.interactions.shape, cls.user_features.shape, cls.item_features.shape
 
     def test_wmrb_loss(self):
-        model = TensorRec(loss_graph=WMRBLossGraph(), stratified_sample=True, logdir='/Users/jasonchen/tmp/test', log_interval=500)
-        model.fit(self.interactions.tocsr(), self.user_features.tocsr(), self.item_features.tocsr()[:self.n_test_item], epochs=30, verbose=True)
+        model = TensorRec(loss_graph=WMRBLossGraph(), stratified_sample=True, logdir='/Users/jasonchen/tmp/test', log_interval=100)
+        model.fit(self.interactions.tocsr(), self.user_features.tocsr(), self.item_features.tocsr()[:self.n_test_item], epochs=10, verbose=True, train_threads=5, use_reg=True)
 
     def test_wmrb_loss_biased(self):
         model = TensorRec(loss_graph=WMRBLossGraph(), biased=True)

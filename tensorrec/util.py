@@ -7,6 +7,9 @@ import tensorflow as tf
 from weakref import WeakKeyDictionary
 import os
 import psutil
+import multiprocessing
+import threading
+import Queue
 
 from .input_utils import create_tensorrec_dataset_from_sparse_matrix, create_tensorrec_dataset_from_tfrecord
 
@@ -216,3 +219,73 @@ def variable_summaries(var, cosine=None, N=100):
 def get_memory():
     process = psutil.Process(os.getpid())
     return process.memory_info().rss
+
+
+def multiple_workers(worker_fn, queue_capacity_input=1000, queue_capacity_output=1000, n_worker=3):
+    """
+    :param worker_fn: lambda (tid, queue): pass
+    :param queue_capacity:
+    :param n_worker:
+    :return:
+    """
+    threads = []
+    queue_input = multiprocessing.Queue(queue_capacity_input)
+    queue_output = multiprocessing.Queue(queue_capacity_output)
+    for i in range(n_worker):
+        t = multiprocessing.Process(target=worker_fn, args=(i, queue_input, queue_output))
+        threads.append(t)
+        t.start()
+
+    print 'multiple_workers: start %s sub-processes' % n_worker
+    return queue_input, queue_output, threads
+
+
+def multiple_workers_thread(worker_fn, queue_capacity_input=1000, queue_capacity_output=1000, n_worker=3):
+    """
+    :param worker_fn: lambda (tid, queue): pass
+    :param queue_capacity:
+    :param n_worker:
+    :return:
+    """
+    threads = []
+    queue_input = Queue.Queue(queue_capacity_input)
+    queue_output = Queue.Queue(queue_capacity_output)
+    for i in range(n_worker):
+        t = threading.Thread(target=worker_fn, args=(i, queue_input, queue_output))
+        threads.append(t)
+        t.start()
+
+    print 'multiple_workers_thread: start %s sub-processes' % n_worker
+    return queue_input, queue_output, threads
+
+
+def stop_subprocess(subproce_list):
+    for t in subproce_list:
+        if isinstance(t, multiprocessing.Process):
+            t.terminate()
+
+
+def test_multiple_workers():
+    def wrap_worker_fn(tid, queue_input, queue_output):
+        print 'sub process', tid
+        while True:
+            r = queue_input.get()
+            queue_output.put(r ** 2)
+
+    queue_input, queue_output, threads = multiple_workers(wrap_worker_fn, 3, 5, 2)
+
+    for i in range(100):
+        print 'input', i
+        queue_input.put(i)
+        while not queue_output.empty():
+            print 'out', queue_output.get()
+
+    threading._sleep(3)
+    stop_subprocess(threads)
+
+
+def get_queue_size(q):
+    try:
+        return q.qsize()
+    except Exception as err:
+        return np.random.choice([-3,-4,-5])
